@@ -5,7 +5,7 @@
   "config": {
     "mission": "Make everyday life easier with useful, accurate, saveable guidance.",
     "audience": "People building everyday household and adulting skills",
-    "pillars": ["budgeting basics", "grocery savings", "cleaning", "home organization", "basic cooking", "routines", "productivity", "time management", "life administration", "digital organization", "beginner home maintenance", "beginner DIY", "career basics", "household systems", "parenting/household organization", "things nobody taught you", "practical checklists", "weekly/monthly resets"],
+    "pillars": ["budgeting basics", "grocery & food savings", "cleaning", "home organization", "basic cooking", "routines & weekly resets", "productivity & time management", "life administration", "beginner home maintenance", "digital organization", "career & work basics", "household & parenting systems", "things nobody taught you", "general practical checklists"],
     "prohibited_topics": ["personalized medical advice", "personalized legal advice", "investment recommendations", "dangerous repairs"],
     "moderation_rules": ["Escalate consequential financial, medical and legal advice", "Human handles sponsorships and blocking", "Approve deletion"]
   }
