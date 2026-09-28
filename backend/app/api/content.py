@@ -1,5 +1,8 @@
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
+import json
+from typing import Literal
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from app.db.session import get_db
 from app.security.auth import authenticated
 from app.models import Content, Publication
@@ -13,6 +16,7 @@ from app.content.director import enqueue
 from app.publishing.service import publish, reconcile
 from app.publishing.providers import ManualExportPublisher
 from app.audit.service import record
+from app.knowledge import bulk as knowledge_bulk
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
 
@@ -118,6 +122,54 @@ def reconcile_publication(brand_id: int, key: int, data: ReconcileInput, admin=D
 @router.get("/knowledge")
 def knowledge(brand_id: int, q: str = "", db=Depends(get_db)):
     return [serialize(k) for k in knowledge_service.search(db, brand_id, q)]
+
+
+class KnowledgeImportInput(BaseModel):
+    format: Literal["csv", "json"]
+    content: str = Field(max_length=20_000_000)
+
+
+class KnowledgeCommitInput(KnowledgeImportInput):
+    preview_token: str = Field(min_length=20, max_length=100)
+    duplicate_mode: Literal["SKIP_DUPLICATES", "UPDATE_MATCHING"]
+    skip_invalid: bool = False
+
+
+@router.get("/knowledge/import/template.csv")
+def knowledge_template():
+    return Response(knowledge_bulk.csv_template(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="dfb-knowledge-template.csv"'})
+
+
+@router.post("/knowledge/import/preview")
+def knowledge_import_preview(brand_id: int, data: KnowledgeImportInput, request: Request,
+                             admin=Depends(authenticated), db=Depends(get_db)):
+    return knowledge_bulk.preview(db, brand_id, data.content, data.format, admin.username,
+                                  admin.id, request.state.session.token_hash)
+
+
+@router.post("/knowledge/import/commit")
+def knowledge_import_commit(brand_id: int, data: KnowledgeCommitInput, request: Request,
+                            admin=Depends(authenticated), db=Depends(get_db)):
+    return knowledge_bulk.commit(db, brand_id, data.content, data.format, data.preview_token,
+                                 data.duplicate_mode, data.skip_invalid, admin.username,
+                                 admin.id, request.state.session.token_hash)
+
+
+@router.get("/knowledge/export.{file_format}")
+def knowledge_export(brand_id: int, file_format: str, db=Depends(get_db)):
+    rows = knowledge_bulk.export_rows(db, brand_id)
+    if file_format == "csv":
+        content = knowledge_bulk.export_csv(rows)
+        media_type = "text/csv; charset=utf-8"
+    elif file_format == "json":
+        content = json.dumps(rows, ensure_ascii=False, indent=2)
+        media_type = "application/json; charset=utf-8"
+    else:
+        from app.core.errors import DomainError
+        raise DomainError("Choose CSV or JSON for knowledge export")
+    return Response(content, media_type=media_type,
+                    headers={"Content-Disposition": f'attachment; filename="dfb-brand-{brand_id}-knowledge.{file_format}"'})
 
 
 @router.post("/knowledge")
