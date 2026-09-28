@@ -1,7 +1,8 @@
 import csv
+import hashlib
 import io
 import json
-from types import SimpleNamespace
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -9,10 +10,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.core.errors import DomainError
-from app.db.session import Base
+from app.db.session import Base, utcnow
 from app.knowledge import bulk
 from app.knowledge.service import search
-from app.models import Audit, Brand, Knowledge
+from app.models import Admin, AdminSession, Audit, Brand, Knowledge
 
 
 @pytest.fixture
@@ -184,31 +185,42 @@ def test_ambiguous_existing_matches_are_rejected(db):
 
 
 def test_import_and_export_http_routes(db):
-    from fastapi import Request
     from fastapi.testclient import TestClient
     from app.db.session import get_db
     from app.main import app
-    from app.security.auth import authenticated
 
     def test_db():
         yield db
 
-    def test_admin(request: Request):
-        request.state.session = SimpleNamespace(token_hash="test-session")
-        return SimpleNamespace(id=10, username="admin")
-
+    admin = Admin(username="admin", password_hash="unused")
+    db.add(admin)
+    db.flush()
+    session_token, csrf = "test-session-token", "test-csrf-token"
+    db.add(AdminSession(token_hash=hashlib.sha256(session_token.encode()).hexdigest(), admin_id=admin.id,
+                        csrf=csrf, expires_at=utcnow() + timedelta(hours=1)))
+    db.commit()
     app.dependency_overrides[get_db] = test_db
-    app.dependency_overrides[authenticated] = test_admin
     try:
         client = TestClient(app)
         template = client.get("/api/brands/1/knowledge/import/template.csv")
-        assert template.status_code == 200 and list(bulk.COLUMNS)[0] in template.text
+        assert template.status_code == 401
         content = csv_content(entry(title="HTTP route"))
-        response = client.post("/api/brands/1/knowledge/import/preview", json={"format": "csv", "content": content})
-        assert response.status_code == 200 and response.json()["valid"] == 1
+        path = "/api/brands/1/knowledge/import/preview"
+        upload = {"file": ("Life_Help_Knowledge_Pack_v1.csv", content.encode(), "text/csv")}
+        assert client.post(path, data={"format": "csv"}, files=upload).status_code == 401
+        client.cookies.set("dfb_session", session_token)
+        assert client.post(path, data={"format": "csv"}, files=upload).status_code == 403
+        response = client.post(path, data={"format": "csv"}, files=upload,
+                               headers={"X-CSRF-Token": csrf}, follow_redirects=False)
+        assert response.status_code == 200 and response.history == []
+        assert response.request.method == "POST"
+        assert response.request.headers["content-type"].startswith("multipart/form-data; boundary=")
+        assert (response.json()["total"], response.json()["valid"], response.json()["invalid"]) == (1, 1, 0)
+        assert response.json()["rows"][0]["record"]["title"] == "HTTP route"
+        assert db.scalars(select(Knowledge)).all() == []
         token = response.json()["preview_token"]
         committed = client.post("/api/brands/1/knowledge/import/commit", json={"format": "csv", "content": content,
-            "preview_token": token, "duplicate_mode": "SKIP_DUPLICATES"})
+            "preview_token": token, "duplicate_mode": "SKIP_DUPLICATES"}, headers={"X-CSRF-Token": csrf})
         assert committed.status_code == 200 and committed.json()["created"] == 1
         exported = client.get("/api/brands/1/knowledge/export.json")
         assert exported.status_code == 200 and exported.json()[0]["title"] == "HTTP route"

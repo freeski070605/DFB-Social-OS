@@ -1,6 +1,6 @@
 import json
 from typing import Literal
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -17,6 +17,7 @@ from app.publishing.service import publish, reconcile
 from app.publishing.providers import ManualExportPublisher
 from app.audit.service import record
 from app.knowledge import bulk as knowledge_bulk
+from app.core.errors import DomainError
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
 
@@ -142,9 +143,16 @@ def knowledge_template():
 
 
 @router.post("/knowledge/import/preview")
-def knowledge_import_preview(brand_id: int, data: KnowledgeImportInput, request: Request,
-                             admin=Depends(authenticated), db=Depends(get_db)):
-    return knowledge_bulk.preview(db, brand_id, data.content, data.format, admin.username,
+async def knowledge_import_preview(brand_id: int, request: Request, format: Literal["csv", "json"] = Form(...),
+                                   file: UploadFile = File(...), admin=Depends(authenticated), db=Depends(get_db)):
+    raw = await file.read(knowledge_bulk.MAX_BYTES + 1)
+    if len(raw) > knowledge_bulk.MAX_BYTES:
+        raise DomainError("Import exceeds 20 MB; split it into smaller files", 413)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise DomainError("File must be UTF-8 encoded CSV or JSON") from exc
+    return knowledge_bulk.preview(db, brand_id, content, format, admin.username,
                                   admin.id, request.state.session.token_hash)
 
 

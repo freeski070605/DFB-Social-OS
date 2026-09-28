@@ -1,5 +1,5 @@
 import {useState} from 'react'
-import {api,brandPath} from '../services/api'
+import {api,apiUpload,brandPath} from '../services/api'
 import {Field,Modal} from '../components/ui'
 
 type Format = 'csv' | 'json'
@@ -24,7 +24,10 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
    let text:string
    try{text=new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer())}
    catch{throw new Error('File must be UTF-8 encoded CSV or JSON')}
-   const result=await api<Preview>(brandPath(brandId,'/knowledge/import/preview'),'POST',{format,content:text})
+   const upload=new FormData()
+   upload.append('format',format)
+   upload.append('file',file)
+   const result=await apiUpload<Preview>(brandPath(brandId,'/knowledge/import/preview'),upload)
    setContent(text);setPreview(result);setPage(0);setFilter('All');setSkipInvalid(false)
   }catch(reason){setError((reason as Error).message)}finally{setBusy(false)}
  }
@@ -43,7 +46,7 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
    <Field label="CSV or JSON file"><input type="file" accept=".csv,.json,text/csv,application/json" onChange={event=>{const next=event.target.files?.[0]||null;setFile(next);setFormat(next?.name.toLowerCase().endsWith('.json')?'json':'csv');setPreview(null);setContent('');setError('')}}/></Field>
    <p><a href={`/api${brandPath(brandId,'/knowledge/import/template.csv')}`} download>Download CSV template</a></p>
    {file&&<p className="muted">{file.name} · {(file.size/1024).toFixed(1)} KB · {format.toUpperCase()}</p>}
-   <button className="primary" disabled={!file||busy} onClick={()=>void validate()}>{busy?'Validating…':'Validate and preview'}</button>
+   <button type="button" className="primary" disabled={!file||busy} onClick={()=>void validate()}>{busy?'Validating…':'Validate and preview'}</button>
    {error&&<p role="alert" className="error">{error}</p>}
    {preview&&<>
     <div className="import-counts"><strong>Total {preview.total}</strong><span>Valid {preview.valid}</span><span>Invalid {preview.invalid}</span><span>Duplicates {preview.duplicates}</span><span>Warnings {preview.warnings}</span></div>
