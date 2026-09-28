@@ -1,0 +1,7 @@
+{
+  "name": "ReemTeam",
+  "slug": "reemteam",
+  "description": "Disabled independent brand configuration. Configure before enabling.",
+  "enabled": false,
+  "config": {"voice": "Confident, community-minded", "pillars": [], "ai": {"provider": "manual"}, "visual": {"background": "#171D30", "foreground": "#F5F6FA", "accent": "#B5A5F5", "muted": "#A0A8C0", "mark": "REEMTEAM"}}
+}

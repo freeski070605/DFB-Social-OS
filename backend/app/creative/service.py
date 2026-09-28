@@ -1,0 +1,40 @@
+import hashlib
+from sqlalchemy import select
+from app.models import Brand, Content, Template
+from app.schemas.domain import Slide, BrandConfig, Visual
+from app.repositories.common import require
+from app.creative.renderer import render_slide
+from app.storage.local import LocalStorage
+from app.audit.service import record
+from app.core.errors import DomainError
+
+
+def render_content(db, brand_id, content_id, actor="admin"):
+    item = require(db, Content, content_id, brand_id)
+    if item.status in {"PUBLISHING", "PUBLISHED", "SCHEDULED"}:
+        raise DomainError("Unschedule before rendering. Published assets are immutable.", 409)
+    if not item.slides:
+        raise DomainError("Add structured slides before rendering")
+    brand = require(db, Brand, brand_id)
+    visual = BrandConfig.model_validate(brand.config).visual
+    templates = {t.kind: t for t in db.scalars(select(Template).where(Template.brand_id == brand_id, Template.enabled.is_(True)))}
+    images = []
+    for i, data in enumerate(item.slides):
+        slide = Slide.model_validate(data)
+        v = Visual.model_validate(templates[slide.kind].config) if slide.kind in templates else visual
+        images.append(render_slide(slide, v, i + 1, len(item.slides)))
+    storage, assets = LocalStorage(), []
+    for i, data in enumerate(images):
+        digest = hashlib.sha256(data).hexdigest()[:24]
+        key = f"{brand.slug}/{item.id}/r{item.revision}-{i + 1}-{digest}.png"
+        storage.write(key, data)
+        preview = __import__("PIL.Image", fromlist=["Image"]).open(__import__("io").BytesIO(data))
+        preview.thumbnail((324, 405))
+        output = __import__("io").BytesIO()
+        preview.save(output, "PNG")
+        preview_key = key.replace(".png", "-preview.png")
+        storage.write(preview_key, output.getvalue())
+        assets.append({"key": key, "preview": preview_key, "template": item.slides[i]["kind"], "sha256": hashlib.sha256(data).hexdigest()})
+    item.assets = assets
+    record(db, "content.render", item.id, brand_id, actor, after={"assets": assets})
+    return item
