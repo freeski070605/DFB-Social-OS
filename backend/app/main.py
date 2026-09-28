@@ -2,20 +2,20 @@ from contextlib import asynccontextmanager
 import logging
 from filelock import FileLock, Timeout
 from fastapi import FastAPI, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text, select
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from app.core.config import settings, ROOT
 from app.core.errors import DomainError
 from app.core.logging import configure
 from app.db.session import SessionLocal, get_db
-from app.models import Content
 from app.brands.service import seed
 from app.security.auth import authenticated
 from app.storage.local import LocalStorage
-from app.api import auth, brands, content, operations, system, webhooks
+from app.api import auth, brands, content, operations, system, webhooks, meta_auth
 
 
 @asynccontextmanager
@@ -80,13 +80,19 @@ async def integrity_error(request, exc):
     return JSONResponse({"detail": "Conflicting or invalid record. Refresh and try again."}, status_code=409)
 
 
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    return JSONResponse({"detail": [{"loc": item.get("loc"), "msg": item.get("msg"), "type": item.get("type")}
+                                    for item in exc.errors()]}, status_code=422)
+
+
 @app.exception_handler(Exception)
 async def unexpected_error(request, exc):
-    logging.getLogger("dfb.api").exception("request_failed", exc_info=exc)
+    logging.getLogger("dfb.api").error("request_failed: %s", type(exc).__name__)
     return JSONResponse({"detail": "Unexpected server error. Inspect logs/dfb.jsonl."}, status_code=500)
 
 
-for router in (auth.router, brands.router, content.router, operations.router, system.router, webhooks.router):
+for router in (auth.router, brands.router, content.router, operations.router, system.router, webhooks.router, meta_auth.router):
     app.include_router(router)
 
 
@@ -102,23 +108,6 @@ def media(key: str):
     if not path.is_file():
         raise DomainError("Asset not found", 404)
     return FileResponse(path, filename=path.name if path.suffix == ".zip" else None)
-
-
-@app.get("/media-public/{key:path}")
-def public_media(key: str, db=Depends(get_db)):
-    # Only a rendered original image referenced by content is public. No exports, previews or arbitrary files.
-    if not key.endswith(".png") or "-preview" in key:
-        raise DomainError("Asset not found", 404)
-    parts = key.split("/")
-    if len(parts) != 3 or not parts[1].isdigit():
-        raise DomainError("Asset not found", 404)
-    item = db.get(Content, int(parts[1]))
-    if not item or not any(asset["key"] == key for asset in item.assets):
-        raise DomainError("Asset not found", 404)
-    path = LocalStorage().path(key)
-    if not path.is_file():
-        raise DomainError("Asset not found", 404)
-    return FileResponse(path, media_type="image/png")
 
 
 dist = ROOT / "frontend/dist"

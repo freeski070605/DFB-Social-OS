@@ -9,7 +9,7 @@ class JsonFormatter(logging.Formatter):
     def format(self, record):
         result = {"timestamp": utcnow().isoformat(), "level": record.levelname, "logger": record.name, "message": record.getMessage()}
         if record.exc_info:
-            result["exception"] = self.formatException(record.exc_info)
+            result["exception"] = record.exc_info[0].__name__
         if hasattr(record, "job_id"):
             result["job_id"] = record.job_id
         return json.dumps(result)

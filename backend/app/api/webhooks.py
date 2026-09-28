@@ -37,8 +37,14 @@ async def receive(request: Request, db=Depends(get_db)):
     except ValueError:
         raise DomainError("Invalid JSON payload")
     received = 0
+    event_platform = {"page": "facebook", "instagram": "instagram"}.get(event.get("object"))
+    if event_platform is None:
+        return {"received": 0}
     for entry in event.get("entry", []):
-        accounts = db.scalars(select(PlatformAccount).where(PlatformAccount.account_id == str(entry.get("id")), PlatformAccount.enabled.is_(True))).all()
+        accounts = db.scalars(select(PlatformAccount).where(PlatformAccount.account_id == str(entry.get("id")),
+            PlatformAccount.platform == event_platform, PlatformAccount.enabled.is_(True))).all()
+        if len({account.brand_id for account in accounts}) > 1:
+            continue  # Existing duplicate assignments are ambiguous; never copy events between brands.
         for account in accounts:
             values = []
             for change in entry.get("changes", []):

@@ -12,7 +12,9 @@ outward_lock = RLock()
 def outward_allowed(db, brand):
     db.refresh(brand)
     setting = db.get(SystemSetting, "autopilot", populate_existing=True)
-    if not brand.enabled or brand.paused or setting is None or setting.value.get("paused", True):
+    if setting is None or setting.value.get("paused", True):
+        raise DomainError("Outward actions paused", 409)
+    if not brand.enabled or brand.paused:
         raise DomainError("Outward actions paused", 409)
 
 

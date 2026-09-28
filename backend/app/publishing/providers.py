@@ -8,6 +8,7 @@ from app.core.errors import ProviderError
 from app.security.secrets import decrypt
 from app.storage.local import LocalStorage
 from app.repositories.common import serialize
+from app.publishing.public_media import public_media_provider
 
 
 class SocialPublisher(Protocol):
@@ -36,7 +37,7 @@ class MetaPublisher:
         token = decrypt(account.token_encrypted)
         url = f"https://graph.facebook.com/{settings().meta_api_version}/{path}"
         try:
-            with httpx.Client(timeout=30) as client:
+            with httpx.Client(timeout=30, trust_env=False) as client:
                 response = client.request(method, url, headers={"Authorization": f"Bearer {token}"},
                     params=data if method == "GET" else None, data=data if method != "GET" else None)
         except httpx.HTTPError:
@@ -67,9 +68,8 @@ class MetaPublisher:
         return self._facebook(content, account, state, checkpoint)
 
     def _instagram(self, content, account, state, checkpoint):
-        origin = settings().public_media_url.rstrip("/")
-        if not origin.startswith("https://") or not content.assets:
-            raise ProviderError("Instagram requires rendered images at DFB_PUBLIC_MEDIA_URL (public HTTPS).")
+        if not content.assets:
+            raise ProviderError("Instagram requires rendered images")
         if len(content.assets) > 10:
             raise ProviderError("This integration supports up to 10 carousel images")
         if len(caption(content)) > 2200:
@@ -77,7 +77,7 @@ class MetaPublisher:
         children = list(state.get("children", []))
         if not state.get("container"):
             for asset in content.assets[len(children):]:
-                data = {"image_url": origin + "/media-public/" + asset["key"]}
+                data = {"image_url": public_media_provider().prepare(content, asset)}
                 if len(content.assets) > 1:
                     data["is_carousel_item"] = "true"
                 else:
@@ -111,12 +111,9 @@ class MetaPublisher:
 
     def _facebook(self, content, account, state, checkpoint):
         media = list(state.get("media", []))
-        origin = settings().public_media_url.rstrip("/")
-        if content.assets and not origin.startswith("https://"):
-            raise ProviderError("Facebook images require DFB_PUBLIC_MEDIA_URL (public HTTPS)")
         for asset in content.assets[len(media):]:
             result = self.request(account, "POST", f"{account.account_id}/photos", {
-                "url": origin + "/media-public/" + asset["key"], "published": "false"})
+                "url": public_media_provider().prepare(content, asset), "published": "false"})
             media.append(result["id"])
             state = {**state, "media": media}
             checkpoint(state)

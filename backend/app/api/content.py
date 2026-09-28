@@ -1,10 +1,8 @@
 from fastapi import APIRouter, Depends
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import select
 from app.db.session import get_db
 from app.security.auth import authenticated
-from app.models import Content, Knowledge, Publication
+from app.models import Content, Publication
 from app.repositories.common import require, serialize, list_brand
 from app.schemas.domain import ContentInput, KnowledgeInput, GenerationInput, ScheduleInput
 from app.content import service as content_service
@@ -14,7 +12,6 @@ from app.scheduling.service import schedule
 from app.content.director import enqueue
 from app.publishing.service import publish, reconcile
 from app.publishing.providers import ManualExportPublisher
-from app.storage.local import LocalStorage
 from app.audit.service import record
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
@@ -91,6 +88,9 @@ def publish_content(brand_id: int, key: int, admin=Depends(authenticated), db=De
 @router.post("/content/{key}/export")
 def export(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
     item = require(db, Content, key, brand_id)
+    if item.status not in {"APPROVED", "SCHEDULED", "PUBLISHED"}:
+        from app.core.errors import DomainError
+        raise DomainError("Approve content before exporting", 409)
     path = ManualExportPublisher().publish(item)
     record(db, "content.export", key, brand_id, admin.username)
     db.commit()

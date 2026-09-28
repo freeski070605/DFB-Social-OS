@@ -49,6 +49,9 @@ class CommunityAction(BaseModel):
     action: str
     reason: str = ""
     reply_id: str = ""
+    body: str = Field(default="", max_length=1500)
+    confirmed_absent: bool = False
+    confirmed_applied: bool = False
 
 
 @router.post("/community/{key}/action")
@@ -64,13 +67,34 @@ def community_action(brand_id: int, key: int, data: CommunityAction, admin=Depen
             raise DomainError("Reconcile this interaction first")
         item.status = "CLOSED"
     elif data.action == "reconcile":
-        if not data.reason:
+        if item.status != "UNKNOWN":
+            raise DomainError("Only uncertain interactions can be reconciled", 409)
+        if not data.reason.strip():
             raise DomainError("A reconciliation reason is required")
-        item.status = "REPLIED" if data.reply_id else "REVIEW"
+        if item.action.startswith("MODERATE_"):
+            if data.confirmed_applied == data.confirmed_absent:
+                raise DomainError("Confirm whether the moderation action happened")
+            item.status = "CLOSED" if data.confirmed_applied else "REVIEW"
+        else:
+            if bool(data.reply_id) == data.confirmed_absent:
+                raise DomainError("Supply the actual reply ID or explicitly confirm no reply was sent")
+            item.status = "REPLIED" if data.reply_id else "REVIEW"
+            item.reply_id = data.reply_id
+    elif data.action == "manual_reply":
+        if not data.reason.strip():
+            raise DomainError("Describe where and when the reply was sent manually")
+        if not data.body.strip():
+            raise DomainError("Record the reply text that was sent manually")
+        if item.status in {"SENDING", "UNKNOWN", "REPLIED", "CLOSED"}:
+            raise DomainError("Reconcile or reopen this interaction before recording a manual reply", 409)
+        item.status = "REPLIED"
         item.reply_id = data.reply_id
+        item.draft = data.body
     else:
         raise DomainError("Unsupported action. Blocking users is performed in the platform.")
-    record(db, "community." + data.action, key, brand_id, admin.username, reason=data.reason)
+    record(db, "community." + data.action, key, brand_id, admin.username,
+           after={"reply_id": item.reply_id, "body": item.draft} if data.action == "manual_reply" else None,
+           reason=data.reason)
     db.commit()
     return serialize(item)
 

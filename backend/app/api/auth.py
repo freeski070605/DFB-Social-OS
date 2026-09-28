@@ -19,7 +19,7 @@ class LoginInput(BaseModel):
 @router.post("/login")
 def sign_in(data: LoginInput, request: Request, response: Response, db=Depends(get_db)):
     token, csrf, admin = login(db, data.username, data.password, request.client.host)
-    response.set_cookie("dfb_session", token, httponly=True, secure=settings().cookie_secure, samesite="strict", max_age=settings().session_hours * 3600, path="/")
+    response.set_cookie("dfb_session", token, httponly=True, secure=settings().cookie_secure, samesite="lax", max_age=settings().session_hours * 3600, path="/")
     return {"username": admin.username, "csrf": csrf}
 
 

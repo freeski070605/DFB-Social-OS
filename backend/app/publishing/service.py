@@ -6,11 +6,19 @@ from app.publishing.providers import MetaPublisher, ManualExportPublisher
 from app.approvals.policy import outward_lock, outward_allowed
 from app.audit.service import record
 from app.core.errors import DomainError, ProviderError
+from app.api.meta_auth import inspect_account
 
 
 def account_for(db, brand_id, platform):
-    return db.scalar(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id, PlatformAccount.platform == platform,
-                                                  PlatformAccount.enabled.is_(True)).order_by(PlatformAccount.id.desc()))
+    accounts = db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
+        PlatformAccount.platform == platform, PlatformAccount.enabled.is_(True))).all()
+    if len(accounts) > 1:
+        raise DomainError("Multiple active Meta accounts. Select one in Settings before publishing.", 409)
+    account = accounts[0] if accounts else None
+    if account and db.scalar(select(PlatformAccount.id).where(PlatformAccount.platform == platform,
+            PlatformAccount.account_id == account.account_id, PlatformAccount.brand_id != brand_id)):
+        raise DomainError("This Meta account is assigned to another brand. Resolve the duplicate account before publishing.", 409)
+    return account
 
 
 def publish(db, brand_id, content_id, actor="system"):
@@ -32,11 +40,16 @@ def publish(db, brand_id, content_id, actor="system"):
                 continue
             if pub.state in {"UNKNOWN", "SENDING"}:
                 raise DomainError("Publication needs administrator reconciliation before any retry", 409)
-            if platform != "manual" and not account_for(db, brand_id, platform):
+            account = account_for(db, brand_id, platform) if platform != "manual" else None
+            if platform != "manual" and not account:
                 pub.state, pub.error = "CONFIGURATION", "No enabled account; use manual export or configure Meta"
                 item.status = "APPROVED"
                 db.commit()
                 raise ProviderError(pub.error)
+            if account:
+                inspect_account(account)
+                if account.config.get("token_status") != "healthy":
+                    raise ProviderError("Meta account token is unhealthy. Reconnect before publishing.")
             item.status, pub.state, pub.attempts = "PUBLISHING", "SENDING", pub.attempts + 1
             db.commit()  # Intent is durable before any external request.
             def checkpoint(state):
@@ -44,7 +57,7 @@ def publish(db, brand_id, content_id, actor="system"):
                 db.commit()
             try:
                 outward_allowed(db, brand)
-                external = ManualExportPublisher().publish(item) if platform == "manual" else MetaPublisher().publish(item, account_for(db, brand_id, platform), dict(pub.request_state), checkpoint)
+                external = ManualExportPublisher().publish(item) if platform == "manual" else MetaPublisher().publish(item, account, dict(pub.request_state), checkpoint)
                 pub.external_id, pub.state, pub.error = external, "EXPORTED" if platform == "manual" else "PUBLISHED", ""
                 record(db, "publication." + pub.state.lower(), item.id, brand_id, actor, after={"platform": platform, "external_id": external})
                 db.commit()

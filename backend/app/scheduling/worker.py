@@ -5,7 +5,7 @@ from sqlalchemy import select, update
 from app.db.session import SessionLocal, utcnow
 from app.models import Job, Brand, Content, Publication, Interaction
 from app.schemas.domain import BrandConfig, GenerationInput
-from app.approvals.policy import permit
+from app.approvals.policy import permit, outward_allowed
 from app.core.errors import ProviderError, DomainError
 from app.audit.service import record
 
@@ -45,17 +45,24 @@ def execute(db, job):
     from app.community.service import classify, reply
     from app.analytics.service import collect
     brand = db.get(Brand, job.brand_id)
-    if not brand or not brand.enabled:
+    if not brand:
+        raise DomainError("Brand not found")
+    if job.kind in {"publish", "reply"}:
+        outward_allowed(db, brand)
+    elif not brand.enabled:
         raise DomainError("Brand disabled")
     if job.kind == "publish":
         item = db.get(Content, job.target_id)
+        if not item or item.brand_id != brand.id:
+            raise DomainError("Scheduled content does not belong to this brand")
+        mode = BrandConfig.model_validate(brand.config).permissions.get("publish", "MANUAL")
+        if mode == "MANUAL" or (mode == "APPROVAL" and not job.payload.get("approved") and not permit(db, brand, "publish", item.id, {"job_id": job.id, "revision": item.revision})):
+            job.status = "WAITING"
+            return
         if item.revision != job.payload.get("revision"):
             raise DomainError("Content changed after scheduling")
         if utcnow() - job.run_at > timedelta(minutes=BrandConfig.model_validate(brand.config).schedule.window_minutes):
             job.status, job.error = "PAUSED", "Missed publishing window. Review and reschedule."
-            return
-        if not job.payload.get("approved") and not permit(db, brand, "publish", item.id, {"job_id": job.id, "revision": item.revision}):
-            job.status = "WAITING"
             return
         publish(db, brand.id, item.id)
     elif job.kind == "director":
@@ -65,7 +72,10 @@ def execute(db, job):
     elif job.kind == "classify":
         classify(db, brand.id, job.target_id)
     elif job.kind == "reply":
-        action = "dm_reply" if db.get(Interaction, job.target_id).kind == "dm" else "comment_reply"
+        item = db.get(Interaction, job.target_id)
+        if not item or item.brand_id != brand.id:
+            raise DomainError("Interaction does not belong to this brand")
+        action = "dm_reply" if item.kind == "dm" else "comment_reply"
         if not permit(db, brand, action, job.target_id, job.payload):
             job.status = "WAITING"
             return

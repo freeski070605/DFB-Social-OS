@@ -1,6 +1,6 @@
 import re
 from datetime import timedelta
-from sqlalchemy import select, func
+from sqlalchemy import select
 from app.models import Interaction, Brand, PlatformAccount
 from app.schemas.domain import BrandConfig, Classification
 from app.ai.providers import provider
@@ -12,6 +12,7 @@ from app.publishing.providers import MetaPublisher
 from app.core.errors import DomainError, ProviderError
 from app.db.session import utcnow
 from app.audit.service import record
+from app.api.meta_auth import inspect_account
 
 SENSITIVE = re.compile(r"\b(diagnos\w*|medic\w*|symptom\w*|pregnan\w*|suicid\w*|lawyer|legal|lawsuit|debt|invest\w*|loan|tax\w*|insurance|mortgage|sponsor\w*|collab\w*|partnership)\b", re.I)
 
@@ -58,10 +59,13 @@ def reply(db, brand_id, key, body, actor="admin", automatic=False):
     item, brand = require(db, Interaction, key, brand_id), require(db, Brand, brand_id)
     if not body.strip() or len(body) > 1500:
         raise DomainError("Reply must be 1–1500 characters")
-    if item.status in {"REPLIED", "SENDING", "UNKNOWN"}:
+    if item.status in {"REPLIED", "SENDING", "UNKNOWN", "CLOSED"}:
         raise DomainError("Already replied or awaiting reconciliation", 409)
     config = BrandConfig.model_validate(brand.config)
     if automatic:
+        action = "dm_reply" if item.kind == "dm" else "comment_reply"
+        if config.permissions.get(action, "MANUAL") != "AUTO":
+            raise DomainError("Automatic replies are not permitted for this brand", 409)
         if item.taken_over or item.action != "AUTO_REPLY" or SENSITIVE.search(item.body + " " + body):
             raise DomainError("This conversation requires a human", 409)
         if db.scalar(select(Interaction.id).where(Interaction.brand_id == brand_id, Interaction.thread_id == item.thread_id,
@@ -80,6 +84,9 @@ def reply(db, brand_id, key, body, actor="admin", automatic=False):
         raise DomainError("Replying to the brand itself is blocked")
     with outward_lock:
         outward_allowed(db, brand)
+        inspect_account(account)
+        if account.config.get("token_status") != "healthy":
+            raise ProviderError("Meta account token is unhealthy. Reconnect before replying.")
         item.status, item.draft = "SENDING", body
         db.commit()
         try:
@@ -102,13 +109,25 @@ def moderate(db, brand_id, key, action, actor):
     account = account_for(db, brand_id, item.platform)
     if not account or item.kind != "comment":
         raise DomainError("A connected comment account is required")
+    if item.status in {"SENDING", "UNKNOWN"}:
+        raise DomainError("Moderation outcome must be reconciled before another action", 409)
     with outward_lock:
         outward_allowed(db, brand)
+        inspect_account(account)
+        if account.config.get("token_status") != "healthy":
+            raise ProviderError("Meta account token is unhealthy. Reconnect before moderation.")
+        item.status, item.action = "SENDING", "MODERATE_" + action.upper()
         record(db, "community." + action + ".intent", item.id, brand_id, actor)
         db.commit()
-        MetaPublisher().moderate(account, item, action)
-        item.status = "CLOSED"
-        record(db, "community." + action, item.id, brand_id, actor)
+        try:
+            MetaPublisher().moderate(account, item, action)
+            item.status = "CLOSED"
+            record(db, "community." + action, item.id, brand_id, actor)
+        except ProviderError as exc:
+            item.status = "UNKNOWN" if exc.uncertain else "REVIEW"
+            record(db, "community." + action + ".failed", item.id, brand_id, actor, result=item.status, reason=exc.message)
+            db.commit()
+            raise
     return item
 
 
