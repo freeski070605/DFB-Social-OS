@@ -6,7 +6,7 @@ from app.schemas.domain import ContentInput, GeneratedContent, BrandConfig
 from app.repositories.common import require, serialize
 from app.audit.service import record
 from app.core.errors import DomainError
-from app.knowledge.service import search
+from app.knowledge.bulk import normalized
 from app.ai.providers import provider
 
 TRANSITIONS = {
@@ -17,10 +17,38 @@ TRANSITIONS = {
 }
 
 
+def canonical_pillar(db, brand_id, pillar):
+    brand = require(db, Brand, brand_id)
+    config = BrandConfig.model_validate(brand.config)
+    match = next((name for name in config.pillars if normalized(name) == normalized(pillar)), None)
+    if not match:
+        raise DomainError("Pillar must match a configured pillar for this brand")
+    return match
+
+
+def generation_candidates(db, brand_id, topic, pillar, selected_ids=None, limit=8):
+    brand = require(db, Brand, brand_id)
+    if not brand.enabled:
+        raise DomainError("Enable the brand before generating content")
+    pillar = canonical_pillar(db, brand_id, pillar)
+    rows = [item for item in db.scalars(select(Knowledge).where(
+        Knowledge.brand_id == brand_id, Knowledge.verification == "APPROVED", Knowledge.enabled.is_(True)))
+        if normalized(item.category) == normalized(pillar)]
+    if selected_ids:
+        by_id = {item.id: item for item in rows}
+        if len(set(selected_ids)) != len(selected_ids) or any(key not in by_id for key in selected_ids):
+            raise DomainError("Selected knowledge must be approved, enabled, and in this brand and pillar")
+        return [by_id[key] for key in selected_ids]
+    words = re.findall(r"\w{3,}", topic.casefold())[:12]
+    rows.sort(key=lambda item: (-sum(word in item.title.casefold() for word in words) * 3 -
+                                sum(word in item.body.casefold() for word in words), item.id))
+    return rows[:limit]
+
+
 def transition(db, item, state, actor="admin", reason=""):
     if state not in TRANSITIONS.get(item.status, set()):
         raise DomainError(f"Invalid transition: {item.status} → {state}", 409)
-    if state == "APPROVED":
+    if state in {"REVIEW", "APPROVED"}:
         quality = quality_check(db, item)
         if quality["errors"]:
             raise DomainError("; ".join(quality["errors"]))
@@ -48,13 +76,22 @@ def quality_check(db, item):
         warnings.append("No approved knowledge attached; administrator must verify factual claims")
     if item.format in {"carousel", "checklist", "steps", "do_dont", "comparison", "single_graphic", "tip", "story"} and not item.slides:
         errors.append("This graphic format needs at least one slide")
+    for number, slide in enumerate(item.slides or [], start=1):
+        if not slide.get("title", "").strip():
+            errors.append(f"Slide {number} title is required")
+        kind = slide.get("kind")
+        values = [value for value in slide.get("items", []) if value.strip()]
+        if kind in {"checklist", "steps"} and not values and not slide.get("body", "").strip():
+            errors.append(f"Slide {number} needs list items or explanation")
+        if kind in {"two_column", "do_dont"} and len(values or [value for value in slide.get("body", "").split("\n\n") if value.strip()]) < 2:
+            errors.append(f"Slide {number} needs at least two columns")
     if "instagram" in item.targets and not item.assets:
         errors.append("Render graphics before approving Instagram content")
     return {"score": max(0, 100 - 35 * len(errors) - 10 * len(warnings)), "status": "BLOCKED" if errors else "REVIEWED", "errors": errors, "warnings": warnings}
 
 
 def save(db, brand_id, data: ContentInput, key=None, actor="admin"):
-    require(db, Brand, brand_id)
+    data.pillar = canonical_pillar(db, brand_id, data.pillar)
     item = require(db, Content, key, brand_id) if key else Content(brand_id=brand_id)
     if key and item.status not in {"IDEA", "DRAFT", "REVIEW", "APPROVED", "FAILED", "ARCHIVED"}:
         raise DomainError("Unschedule content before editing. Published content is immutable; create a variant.", 409)
@@ -93,9 +130,10 @@ def generate(db, brand_id, request, actor="admin"):
     if not brand.enabled:
         raise DomainError("Enable the brand before generating content")
     parent = require(db, Content, request.parent_id, brand_id) if request.parent_id else None
-    refs = search(db, brand_id, request.topic + " " + request.pillar, approved=True, limit=8)
+    request.pillar = canonical_pillar(db, brand_id, request.pillar)
+    refs = generation_candidates(db, brand_id, request.topic, request.pillar, request.knowledge_refs)
     if not refs:
-        raise DomainError("Add and approve relevant knowledge before AI generation")
+        raise DomainError("Approve and enable knowledge for this pillar before AI generation")
     recent = db.scalars(select(Content).where(Content.brand_id == brand_id).order_by(Content.id.desc()).limit(100)).all()
     if not parent and any(similarity(request.topic, c.topic) > .85 for c in recent if c.status != "ARCHIVED"):
         raise DomainError("A similar topic already exists. Repurpose it or choose a different topic.", 409)

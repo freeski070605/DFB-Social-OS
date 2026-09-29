@@ -20,7 +20,9 @@ def render_content(db, brand_id, content_id, actor="admin"):
     templates = {t.kind: t for t in db.scalars(select(Template).where(Template.brand_id == brand_id, Template.enabled.is_(True)))}
     images = []
     for i, data in enumerate(item.slides):
-        slide = Slide.model_validate(data)
+        if not data.get("title", "").strip():
+            raise DomainError(f"Slide {i + 1} title is required before rendering")
+        slide = Slide.model_validate({**data, "items": [value for value in data.get("items", []) if value.strip()]})
         v = Visual.model_validate(templates[slide.kind].config) if slide.kind in templates else visual
         images.append(render_slide(slide, v, i + 1, len(item.slides)))
     storage, assets = LocalStorage(), []

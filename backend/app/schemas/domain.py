@@ -123,13 +123,20 @@ class Slide(StrictModel):
     items: list[str] = Field(default_factory=list, max_length=10)
 
 
+class DraftSlide(StrictModel):
+    title: str = Field(default="", max_length=180)
+    body: str = Field(default="", max_length=1400)
+    kind: TemplateKind = "statement"
+    items: list[str] = Field(default_factory=list, max_length=10)
+
+
 class ContentInput(StrictModel):
     topic: str = Field(min_length=1, max_length=300)
     pillar: str = Field(min_length=1, max_length=120)
     format: Format = "carousel"
     hook: str = Field(default="", max_length=500)
     body: str = Field(default="", max_length=15000)
-    slides: list[Slide] = Field(default_factory=list, max_length=20)
+    slides: list[DraftSlide] = Field(default_factory=list, max_length=20)
     caption: str = Field(default="", max_length=2200)
     cta: str = Field(default="", max_length=500)
     hashtags: list[str] = Field(default_factory=list, max_length=30)
@@ -142,6 +149,7 @@ class ContentInput(StrictModel):
 class GeneratedContent(ContentInput):
     hook: str = Field(min_length=1, max_length=500)
     caption: str = Field(min_length=1, max_length=2200)
+    slides: list[Slide] = Field(default_factory=list, max_length=20)
 
 
 class GenerationInput(StrictModel):
@@ -149,6 +157,7 @@ class GenerationInput(StrictModel):
     pillar: str = Field(min_length=1, max_length=120)
     format: Format = "carousel"
     parent_id: int | None = None
+    knowledge_refs: list[int] = Field(default_factory=list, max_length=8)
 
 
 class ScheduleInput(StrictModel):
