@@ -1,0 +1,18 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    {"source": "/api/:path*", "destination": "https://social-api.dfbsolutions.co/api/:path*"},
+    {"source": "/health", "destination": "https://social-api.dfbsolutions.co/health"},
+    {"source": "/(.*)", "destination": "/index.html"}
+  ],
+  "headers": [
+    {"source": "/(.*)", "headers": [
+      {"key": "X-Content-Type-Options", "value": "nosniff"},
+      {"key": "X-Frame-Options", "value": "DENY"},
+      {"key": "Referrer-Policy", "value": "same-origin"},
+      {"key": "Content-Security-Policy", "value": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"}
+    ]},
+    {"source": "/sw.js", "headers": [{"key": "Cache-Control", "value": "no-cache"}]},
+    {"source": "/index.html", "headers": [{"key": "Cache-Control", "value": "no-cache"}]}
+  ]
+}

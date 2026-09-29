@@ -1,5 +1,5 @@
 import {useState} from 'react'
-import {api,apiUpload,brandPath} from '../services/api'
+import {api,apiUpload,apiUrl,brandPath} from '../services/api'
 import {Field,Modal} from '../components/ui'
 
 type Format = 'csv' | 'json'
@@ -41,7 +41,7 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
   {!result?<>
    <p className="muted">Upload → Validate → Preview → Resolve → Commit. Nothing is added to knowledge during preview.</p>
   <Field label="CSV or JSON file"><input type="file" accept=".csv,.json,text/csv,application/json" onChange={event=>{const next=event.target.files?.[0]||null;setFile(next);setFormat(next?.name.toLowerCase().endsWith('.json')?'json':'csv');setPreview(null);setError('')}}/></Field>
-   <p><a href={`/api${brandPath(brandId,'/knowledge/import/template.csv')}`} download>Download CSV template</a></p>
+   <p><a href={apiUrl(brandPath(brandId,'/knowledge/import/template.csv'))} download>Download CSV template</a></p>
    {file&&<p className="muted">{file.name} · {(file.size/1024).toFixed(1)} KB · {format.toUpperCase()}</p>}
    <button type="button" className="primary" disabled={!file||busy} onClick={()=>void validate()}>{busy?'Validating…':'Validate and preview'}</button>
    {error&&<p role="alert" className="error">{error}</p>}
@@ -60,5 +60,5 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
 }
 
 export function KnowledgeExport({brandId,close}:{brandId:number;close:()=>void}) {
- return <div className="knowledge-transfer-scope"><Modal title="Export knowledge" close={close}><p>Download every knowledge record for this brand, including sources, tags, restrictions, verification, and retrieval state.</p><div className="button-row"><a className="button-link" href={`/api${brandPath(brandId,'/knowledge/export.csv')}`} download>Download CSV</a><a className="button-link" href={`/api${brandPath(brandId,'/knowledge/export.json')}`} download>Download JSON</a></div></Modal></div>
+ return <div className="knowledge-transfer-scope"><Modal title="Export knowledge" close={close}><p>Download every knowledge record for this brand, including sources, tags, restrictions, verification, and retrieval state.</p><div className="button-row"><a className="button-link" href={apiUrl(brandPath(brandId,'/knowledge/export.csv'))} download>Download CSV</a><a className="button-link" href={apiUrl(brandPath(brandId,'/knowledge/export.json'))} download>Download JSON</a></div></Modal></div>
 }

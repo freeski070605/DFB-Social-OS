@@ -40,14 +40,14 @@ def test_meta_business_login_exchanges_and_discovers_without_selecting_or_publis
     monkeypatch.setattr(meta_auth, "encrypt", credential_secrets.encrypt)
     calls = []
 
-    def metadata(token):
+    def metadata(token, *, stage="credential_validation"):
         calls.append(("debug_token", token))
         return {"valid": True, "expires_at": None, "data_access_expires_at": None,
                 "scopes": ["pages_show_list"], "token_type": "SYSTEM_USER"}
 
     monkeypatch.setattr(meta_auth, "token_metadata", metadata)
 
-    def fake_graph(path, *, token=None, params=None):
+    def fake_graph(path, *, token=None, params=None, stage="graph_request"):
         calls.append((path, token, params))
         if path == "oauth/access_token":
             assert params == {"client_id": "app", "client_secret": "app-secret",
@@ -116,8 +116,8 @@ def test_meta_graph_rejects_provider_error_without_logging_credentials(monkeypat
             return httpx.Response(400, json={"error": {"message": "secret private-app-secret code private-code"}})
 
     monkeypatch.setattr(meta_auth.httpx, "Client", FailedClient)
-    with pytest.raises(ProviderError, match="Meta rejected authorization") as caught:
-        meta_auth.graph("oauth/access_token", params={"client_secret": "private-app-secret", "code": "private-code"})
+    with pytest.raises(ProviderError, match="Meta code_exchange failed") as caught:
+        meta_auth.graph("oauth/access_token", params={"client_secret": "private-app-secret", "code": "private-code"}, stage="code_exchange")
     assert "private-app-secret" not in str(caught.value) + caplog.text
     assert "private-code" not in str(caught.value) + caplog.text
 

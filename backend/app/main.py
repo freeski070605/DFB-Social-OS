@@ -65,7 +65,7 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "same-origin"
-    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api") else "no-cache"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith("/api") or request.url.path == "/health" else "no-cache"
     response.headers["Content-Security-Policy"] = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
     return response
 
@@ -99,7 +99,7 @@ for router in (auth.router, brands.router, content.router, operations.router, sy
 @app.get("/health")
 def health(db=Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok"}
 
 
 @app.get("/api/media/{key:path}", dependencies=[Depends(authenticated)])
@@ -119,6 +119,11 @@ if (dist / "assets").exists():
 def frontend(path: str):
     if path.startswith("api/") or path.startswith("media-public/"):
         raise DomainError("Endpoint not found", 404)
+    if path in {"manifest.webmanifest", "sw.js", "icon-192.png", "icon-512.png"}:
+        asset = dist / path
+        if not asset.is_file():
+            raise DomainError("Frontend asset not found", 404)
+        return FileResponse(asset)
     if not (dist / "index.html").exists():
         raise DomainError("Build the frontend with npm run build in frontend/", 503)
     return FileResponse(dist / "index.html")

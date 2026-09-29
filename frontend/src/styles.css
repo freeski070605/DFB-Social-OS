@@ -17,3 +17,5 @@
 .review-source,.review-restrictions{overflow-wrap:anywhere}.review-sensitive{padding:8px 10px;border-left:3px solid var(--coral);background:#fbf0e9;color:#704133;font-size:13px;font-weight:700}
 .review-detail{display:grid;gap:12px}.review-detail p{margin:0}.review-body{max-height:42vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:16px;border:1px solid var(--line);background:#f7f7f0;line-height:1.65}.review-confirm{display:grid;gap:9px}.review-confirm p{margin:0;overflow-wrap:anywhere}
 @media(max-width:900px){.review-filter-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:520px){.review-filter-grid{grid-template-columns:1fr}}
+.backend-offline{margin:20px clamp(18px,3vw,42px);padding:18px;border-left:4px solid var(--coral);background:var(--white);color:var(--ink);font-size:14px}
+@media(max-width:480px){.topbar-status{font-size:11px}.topbar-status .status-dot{flex:none}}

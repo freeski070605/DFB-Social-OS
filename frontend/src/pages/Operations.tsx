@@ -1,7 +1,7 @@
 import {useState} from 'react'
 import {Download, Pause, Play, RefreshCw, RotateCcw, ShieldAlert} from 'lucide-react'
 import {useData} from '../hooks/useData'
-import {api, brandPath, date, label} from '../services/api'
+import {api, apiUrl, brandPath, date, label} from '../services/api'
 import {Badge, Empty, Field, JsonView, Panel, Status, useAction} from '../components/ui'
 import type {Audit, Brand, Content, Job, Publication} from '../types'
 
@@ -41,7 +41,7 @@ export default function Operations({brand, page, refresh}: {brand: Brand; page: 
   if (page === 'Backups') return <>
     <div className="toolbar"><p className="muted grow">Backups include the database, brand configuration, renderer font, generated media, and encrypted account tokens. Keep the encryption key separately.</p><button className="primary" disabled={busy} onClick={()=>run(async()=>{await api('/backup','POST');await reloadBackups()},'Backup created')}><Download size={16}/>Create backup</button></div>
     <p className="notice">Keep a separate copy of your encryption key. Restoring invalidates sessions and forces autopilot paused. A safety backup is created before restore.</p><Status error={backupsError} loading={backupsLoading}/>{!backupsLoading&&!backups?.length&&<Empty title="No backups yet" text="Create a backup before your first publishing setup."/>}
-    <div className="operation-list">{backups?.map(file=><Panel key={file.name}><div className="panel-heading"><div><h3>{file.name}</h3><small>{new Date(file.created_at*1000).toLocaleString()} · {(file.size/1024/1024).toFixed(2)} MB</small></div><div className="button-row"><a className="button-link" href={`/api/backups/${encodeURIComponent(file.name)}`}><Download size={16}/>Download</a><button disabled={busy} onClick={()=>{if(confirm(`Restore ${file.name}? Current data will first be backed up. You will be signed out and autopilot will remain paused.`))void run(async()=>{await api(`/backups/${encodeURIComponent(file.name)}/restore`,'POST');window.dispatchEvent(new Event('dfb:signout'))},'Restore complete; sign in again')}}><RotateCcw size={16}/>Restore</button></div></div></Panel>)}</div>
+    <div className="operation-list">{backups?.map(file=><Panel key={file.name}><div className="panel-heading"><div><h3>{file.name}</h3><small>{new Date(file.created_at*1000).toLocaleString()} · {(file.size/1024/1024).toFixed(2)} MB</small></div><div className="button-row"><a className="button-link" href={apiUrl(`/backups/${encodeURIComponent(file.name)}`)}><Download size={16}/>Download</a><button disabled={busy} onClick={()=>{if(confirm(`Restore ${file.name}? Current data will first be backed up. You will be signed out and autopilot will remain paused.`))void run(async()=>{await api(`/backups/${encodeURIComponent(file.name)}/restore`,'POST');window.dispatchEvent(new Event('dfb:signout'))},'Restore complete; sign in again')}}><RotateCcw size={16}/>Restore</button></div></div></Panel>)}</div>
   </>
 
   return <>

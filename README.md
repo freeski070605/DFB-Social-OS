@@ -36,3 +36,5 @@ Run future migrations with `Set-ExecutionPolicy -Scope Process Bypass; .\scripts
 7. **System** shows provider health and global/per-brand pause controls. Keep publishing in **APPROVAL** mode for initial operation. Unpause globally and for a brand only after confirming its rules, accounts, and approval queue; AUTO publication is an explicit risk decision.
 
 See [docs/OPERATIONS.md](docs/OPERATIONS.md) for Ollama, first admin, manual-mode, scheduling, and recovery details, and [docs/PUBLISHING.md](docs/PUBLISHING.md) for Meta scope, token, webhook, and media setup. Feature coverage and adapter limits are documented there; not every Meta content type is publishable through this integration.
+
+For optional HTTPS desktop/mobile access with a Vercel frontend and named Cloudflare Tunnel, see [docs/MOBILE_ACCESS.md](docs/MOBILE_ACCESS.md). Deployment and DNS changes are manual.

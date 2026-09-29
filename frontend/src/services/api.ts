@@ -1,7 +1,11 @@
 let csrf = ''
 export function setCsrf(value: string) { csrf = value }
+// Empty in production so cookies and OAuth callbacks stay on the frontend origin.
+const apiBase = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+export const apiUrl = (path: string) => `${apiBase}/api${path}`
+export const healthUrl = `${apiBase}/health`
 export async function api<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
-  const response = await fetch('/api' + path, {method, credentials: 'include', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: body === undefined ? undefined : JSON.stringify(body)})
+  const response = await fetch(apiUrl(path), {method, credentials: 'include', headers: {'Content-Type': 'application/json', 'X-CSRF-Token': csrf}, body: body === undefined ? undefined : JSON.stringify(body)})
   const data = await response.json()
   if (!response.ok) {
     const detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)
@@ -11,7 +15,7 @@ export async function api<T>(path: string, method = 'GET', body?: unknown): Prom
   return data as T
 }
 export async function apiUpload<T>(path: string, body: FormData): Promise<T> {
-  const response = await fetch('/api' + path, {method: 'POST', credentials: 'include', headers: {'X-CSRF-Token': csrf}, body})
+  const response = await fetch(apiUrl(path), {method: 'POST', credentials: 'include', headers: {'X-CSRF-Token': csrf}, body})
   const data = await response.json()
   if (!response.ok) {
     const detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)

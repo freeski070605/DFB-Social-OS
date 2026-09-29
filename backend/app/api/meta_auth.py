@@ -1,5 +1,8 @@
 """Facebook Login connection for Pages and Page-linked Instagram professional accounts."""
 import hashlib
+import json
+import logging
+import re
 import secrets
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -19,6 +22,36 @@ from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 
 router = APIRouter(prefix="/api", tags=["meta"])
+log = logging.getLogger("dfb.meta_callback")
+
+
+def diagnostic(stage, **fields):
+    log.info("meta_callback %s", json.dumps({"stage": stage, **fields}, sort_keys=True))
+
+
+def safe_meta_message(message, secrets_to_redact=()):
+    if not isinstance(message, str):
+        return ""
+    for secret in secrets_to_redact:
+        if secret:
+            message = message.replace(str(secret), "[REDACTED]")
+    message = re.sub(r"https?://\S+", "[REDACTED]", message)
+    message = re.sub(r"(?i)\b(?:access_token|token|code|state|client_secret|secret)\s*(?:[=:]\s*|\s+)[^\s,;]+", "[REDACTED]", message)
+    message = re.sub(r"\b[A-Za-z0-9_\-]{24,}\b", "[REDACTED]", message)
+    return re.sub(r"[^\w\s.,:;!?()'\-/\[\]]", "?", message[:300])
+
+
+def meta_error(stage, response, result, secrets_to_redact=()):
+    error = result.get("error") if isinstance(result, dict) else None
+    error = error if isinstance(error, dict) else {}
+    fields = {"http_status": response.status_code,
+              "error_type": safe_meta_message(error.get("type", ""), secrets_to_redact),
+              "error_code": error.get("code") if isinstance(error.get("code"), int) else None,
+              "error_subcode": error.get("error_subcode") if isinstance(error.get("error_subcode"), int) else None,
+              "error_message": safe_meta_message(error.get("message", ""), secrets_to_redact)}
+    diagnostic(stage, outcome="upstream_error", **fields)
+    detail = ", ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
+    raise ProviderError(f"Meta {stage} failed: {detail}")
 
 
 def configured():
@@ -32,25 +65,35 @@ def configured():
     return cfg
 
 
-def graph(path, *, token=None, params=None):
+def graph(path, *, token=None, params=None, stage="graph_request"):
     cfg = settings()
     url = f"https://graph.facebook.com/{cfg.meta_api_version}/{path}"
     try:
         with httpx.Client(timeout=20, trust_env=False) as client:
             response = client.get(url, params=params, headers={"Authorization": f"Bearer {token}"} if token else {})
             result = response.json()
-    except (httpx.HTTPError, ValueError):
-        raise ProviderError("Meta authorization request failed. Retry connection or check Meta service status.")
+    except httpx.HTTPError:
+        diagnostic(stage, outcome="transport_error")
+        raise ProviderError(f"Meta {stage} transport request failed") from None
+    except ValueError:
+        diagnostic(stage, outcome="malformed_json", http_status=response.status_code)
+        raise ProviderError(f"Meta {stage} returned malformed JSON (HTTP {response.status_code})") from None
     if response.is_error or not isinstance(result, dict) or "error" in result:
-        raise ProviderError("Meta rejected authorization or account discovery. Review app permissions and reconnect.")
+        sensitive = [token, getattr(cfg, "meta_app_secret", "")]
+        sensitive.extend(value for key, value in (params or {}).items() if key in {"code", "state", "input_token", "access_token", "client_secret"})
+        meta_error(stage, response, result, sensitive)
     return result
 
 
-def token_metadata(token):
+def token_metadata(token, *, stage="credential_validation"):
     cfg = settings()
     if not cfg.meta_app_id or not cfg.meta_app_secret:
         raise DomainError("Set DFB_META_APP_ID and DFB_META_APP_SECRET to inspect Meta tokens")
-    result = graph("debug_token", params={"input_token": token, "access_token": f"{cfg.meta_app_id}|{cfg.meta_app_secret}"})["data"]
+    response = graph("debug_token", params={"input_token": token, "access_token": f"{cfg.meta_app_id}|{cfg.meta_app_secret}"}, stage=stage)
+    result = response.get("data")
+    if not isinstance(result, dict) or not isinstance(result.get("is_valid"), bool):
+        diagnostic(stage, outcome="malformed_response")
+        raise ProviderError(f"Meta {stage} returned malformed credential data")
     return {"valid": bool(result.get("is_valid")), "expires_at": result.get("expires_at") or None,
             "data_access_expires_at": result.get("data_access_expires_at") or None,
             "scopes": result.get("scopes", []), "token_type": result.get("type", "")}
@@ -105,21 +148,33 @@ def start_connection(brand_id: int, request: Request, admin=Depends(authenticate
 
 @router.get("/meta/callback")
 def callback(request: Request, code: str = "", state: str = "", error: str = "", admin=Depends(authenticated), db=Depends(get_db)):
+    diagnostic("session_validation", outcome="passed")
     cfg = configured()
     key = "meta_oauth:" + hashlib.sha256(state.encode()).hexdigest()
     pending = db.get(SystemSetting, key) if state else None
     if not pending or pending.value.get("admin_id") != admin.id or pending.value.get("session_hash") != request.state.session.token_hash or pending.value.get("expires_at", "") < utcnow().isoformat():
+        diagnostic("state_validation", outcome="failed")
         raise DomainError("Meta connection expired or state validation failed. Start again from Settings.", 403)
+    diagnostic("state_validation", outcome="passed")
     brand_id = pending.value["brand_id"]
     db.delete(pending)
     db.commit()  # The state is one use, including when Meta returns an error.
+    diagnostic("state_consumed")
     if error or not code:
+        diagnostic("authorization_result", outcome="denied_or_missing_code")
         raise DomainError("Meta authorization was cancelled or denied. Start connection again.", 400)
     # A system-user configuration returns the usable token directly from the code exchange.
     # The user-token long-lived exchange is not valid for this credential type.
-    credential = graph("oauth/access_token", params={"client_id": cfg.meta_app_id, "client_secret": cfg.meta_app_secret,
-                                                     "redirect_uri": cfg.meta_redirect_uri, "code": code})["access_token"]
+    diagnostic("code_exchange", outcome="started")
+    exchange = graph("oauth/access_token", params={"client_id": cfg.meta_app_id, "client_secret": cfg.meta_app_secret,
+                                                   "redirect_uri": cfg.meta_redirect_uri, "code": code}, stage="code_exchange")
+    credential = exchange.get("access_token")
+    diagnostic("code_exchange", outcome="completed", credential_returned=bool(credential))
+    if not isinstance(credential, str) or not credential:
+        raise ProviderError("Meta code_exchange returned no usable credential")
     credential_meta = token_metadata(credential)
+    diagnostic("credential_validation", outcome="completed", valid=credential_meta["valid"],
+               credential_type=credential_meta["token_type"])
     if not credential_meta["valid"]:
         raise ProviderError("Meta returned an invalid credential. Reconnect this account.")
     granted = sorted(credential_meta.get("scopes", []))
@@ -129,12 +184,23 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         params = {"fields": "id,name,access_token,tasks,instagram_business_account", "limit": 100}
         if after:
             params["after"] = after
-        page = graph("me/accounts", token=credential, params=params)
-        for found in page.get("data", []):
+        diagnostic("page_discovery", outcome="started")
+        page = graph("me/accounts", token=credential, params=params, stage="page_discovery")
+        found_pages = page.get("data")
+        if not isinstance(found_pages, list) or any(not isinstance(item, dict) for item in found_pages):
+            diagnostic("page_discovery", outcome="malformed_response")
+            raise ProviderError("Meta page_discovery returned malformed Page data")
+        diagnostic("page_discovery", outcome="completed", pages_discovered=len(found_pages))
+        for found in found_pages:
             page_id, page_token = str(found.get("id", "")), found.get("access_token") or credential
             if not page_id.isdigit():
                 continue
-            meta = token_metadata(page_token)
+            if not isinstance(page_token, str):
+                diagnostic("page_token_retrieval", outcome="malformed_response")
+                raise ProviderError("Meta page_token_retrieval returned malformed credential")
+            diagnostic("page_token_retrieval", outcome="completed", credential_returned=True,
+                       credential_source="page" if found.get("access_token") else "business_login")
+            meta = token_metadata(page_token, stage="page_credential_validation")
             if not meta["valid"]:
                 continue
             common = {"source": "oauth", "page_id": page_id, "permissions": meta.get("scopes", granted),
@@ -142,28 +208,40 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
                       "data_access_expires_at": meta["data_access_expires_at"], "token_status": "healthy",
                       "token_type": meta.get("token_type", ""),
                       "last_checked": utcnow().isoformat() + "Z"}
+            linked = found.get("instagram_business_account")
+            if linked is not None and not isinstance(linked, dict):
+                diagnostic("instagram_discovery", outcome="malformed_response")
+                raise ProviderError("Meta instagram_discovery returned malformed account data")
+            diagnostic("instagram_discovery", outcome="completed", instagram_accounts_discovered=bool(linked and linked.get("id")))
             for platform, identity, name in (("facebook", page_id, found.get("name", "")),
-                                             ("instagram", str(found.get("instagram_business_account", {}).get("id", "")), "")):
+                                             ("instagram", str((linked or {}).get("id", "")), "")):
                 if not identity or not identity.isdigit():
                     continue
                 if db.scalar(select(PlatformAccount.id).where(PlatformAccount.platform == platform,
                     PlatformAccount.account_id == identity, PlatformAccount.brand_id != brand_id)):
                     continue
                 if platform == "instagram":
-                    try:
-                        name = graph(identity, token=page_token, params={"fields": "id,username"}).get("username", identity)
-                    except ProviderError:
-                        name = identity
+                    identity_data = graph(identity, token=page_token, params={"fields": "id,username"}, stage="instagram_identity")
+                    if str(identity_data.get("id")) != identity:
+                        diagnostic("instagram_identity", outcome="malformed_response")
+                        raise ProviderError("Meta instagram_identity returned a different account ID")
+                    name = identity_data.get("username") or identity
                 account = db.scalar(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
                     PlatformAccount.platform == platform, PlatformAccount.account_id == identity))
                 if not account:
                     account = PlatformAccount(brand_id=brand_id, platform=platform, account_id=identity)
                     db.add(account)
                 # Discovery never authorizes a publishing destination. The admin selects it explicitly.
+                diagnostic("credential_encryption", outcome="started", platform=platform)
                 account.token_encrypted, account.enabled = encrypt(page_token), False
+                diagnostic("credential_encryption", outcome="completed", platform=platform)
                 account.config = {**common, "name": name or identity}
                 connected += 1
-        cursor = page.get("paging", {}).get("cursors", {}).get("after")
+        paging = page.get("paging") or {}
+        if not isinstance(paging, dict) or not isinstance(paging.get("cursors") or {}, dict):
+            diagnostic("page_discovery", outcome="malformed_paging")
+            raise ProviderError("Meta page_discovery returned malformed paging data")
+        cursor = (paging.get("cursors") or {}).get("after")
         if not page.get("data") or not cursor or cursor == after:
             break
         after = cursor
@@ -171,6 +249,9 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         for existing in db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
                                                                   PlatformAccount.platform.in_(["facebook", "instagram"]))):
             existing.enabled = False
+    diagnostic("database_persistence", outcome="started", accounts_discovered=connected)
     record(db, "meta.connect_complete", brand_id, brand_id, admin.username, details={"accounts": connected})
     db.commit()
+    diagnostic("database_persistence", outcome="completed", accounts_discovered=connected)
+    diagnostic("final_redirect", outcome="completed", accounts_discovered=connected)
     return RedirectResponse(f"/?meta_connected={brand_id}&count={connected}", status_code=303)
