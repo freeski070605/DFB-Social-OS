@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     meta_api_version: str = "v23.0"
     meta_app_id: str = ""
     meta_app_secret: str = ""
+    meta_config_id: str = ""
     meta_redirect_uri: str = ""
     meta_verify_token: str = ""
     youtube_client_id: str = ""

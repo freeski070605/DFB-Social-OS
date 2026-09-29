@@ -1,17 +1,22 @@
 import hashlib
 import json
+import logging
 import sqlite3
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.api import meta_auth
 from app.audit import service as audit
+from app.core.config import Settings
+from app.core.logging import MetaCallbackAccessFilter
+from app.security import secrets as credential_secrets
 from app.core.errors import DomainError, ProviderError
 from app.db.session import Base
 from app.models import Admin, Brand, PlatformAccount, SystemSetting
@@ -19,26 +24,42 @@ from app.publishing import providers
 from app.publishing.public_media import LocalUnavailablePublicMediaProvider
 
 
-def test_meta_oauth_state_is_one_use_and_accounts_are_brand_scoped(monkeypatch):
+def test_meta_config_id_uses_settings_environment(monkeypatch):
+    monkeypatch.setenv("DFB_META_CONFIG_ID", "business-configuration-id")
+    assert Settings(_env_file=None).meta_config_id == "business-configuration-id"
+
+
+def test_meta_business_login_exchanges_and_discovers_without_selecting_or_publishing(monkeypatch, caplog):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
-    config = SimpleNamespace(meta_app_id="app", meta_app_secret="secret", meta_redirect_uri="https://admin.example/api/meta/callback",
-                             meta_api_version="v23.0", encryption_key="test-key")
+    config = SimpleNamespace(meta_app_id="app", meta_app_secret="app-secret", meta_config_id="business-config",
+                             meta_redirect_uri="https://admin.example/api/meta/callback",
+                             meta_api_version="v23.0", encryption_key=Fernet.generate_key().decode())
     monkeypatch.setattr(meta_auth, "settings", lambda: config)
-    monkeypatch.setattr(meta_auth, "encrypt", lambda value: "encrypted:" + value)
-    monkeypatch.setattr(meta_auth, "token_metadata", lambda token: {"valid": True, "expires_at": None, "data_access_expires_at": None})
+    monkeypatch.setattr(credential_secrets, "settings", lambda: config)
+    monkeypatch.setattr(meta_auth, "encrypt", credential_secrets.encrypt)
+    calls = []
+
+    def metadata(token):
+        calls.append(("debug_token", token))
+        return {"valid": True, "expires_at": None, "data_access_expires_at": None,
+                "scopes": ["pages_show_list"], "token_type": "SYSTEM_USER"}
+
+    monkeypatch.setattr(meta_auth, "token_metadata", metadata)
 
     def fake_graph(path, *, token=None, params=None):
+        calls.append((path, token, params))
         if path == "oauth/access_token":
-            return {"access_token": "long-user" if params.get("grant_type") else "short-user"}
-        if path == "me/permissions":
-            return {"data": [{"permission": "pages_show_list", "status": "granted"}]}
+            assert params == {"client_id": "app", "client_secret": "app-secret",
+                              "redirect_uri": config.meta_redirect_uri, "code": "authorization-code"}
+            return {"access_token": "system-user-token"}
         if path == "me/accounts":
+            assert token == "system-user-token"
             return {"data": [{"id": "123", "name": "Page A", "access_token": "page-token-a",
                               "instagram_business_account": {"id": "456"}},
-                             {"id": "789", "name": "Page B", "access_token": "page-token-b"}]}
+                             {"id": "789", "name": "Page B"}]}
         if path == "456":
-            return {"username": "ig_a"}
+            return {"id": "456", "username": "ig_a"}
         raise AssertionError(path)
 
     monkeypatch.setattr(meta_auth, "graph", fake_graph)
@@ -48,20 +69,65 @@ def test_meta_oauth_state_is_one_use_and_accounts_are_brand_scoped(monkeypatch):
         db.add_all([admin, Brand(id=1, name="A", slug="a", config={}), Brand(id=2, name="B", slug="b", config={})])
         db.commit()
         url = meta_auth.start_connection(1, request, admin=admin, db=db)["authorization_url"]
-        state = parse_qs(urlparse(url).query)["state"][0]
+        query = parse_qs(urlparse(url).query)
+        assert query["config_id"] == ["business-config"]
+        assert query["response_type"] == ["code"]
+        assert query["override_default_response_type"] == ["true"]
+        assert "scope" not in query
+        state = query["state"][0]
         with pytest.raises(DomainError, match="state validation failed"):
             meta_auth.callback(SimpleNamespace(state=SimpleNamespace(session=SimpleNamespace(token_hash="other"))),
-                               code="code", state=state, admin=admin, db=db)
-        result = meta_auth.callback(request, code="code", state=state, admin=admin, db=db)
+                               code="authorization-code", state=state, admin=admin, db=db)
+        result = meta_auth.callback(request, code="authorization-code", state=state, admin=admin, db=db)
         assert result.status_code == 303
         accounts = db.scalars(select(PlatformAccount).order_by(PlatformAccount.id)).all()
         assert [(a.platform, a.account_id, a.enabled) for a in accounts] == [
             ("facebook", "123", False), ("instagram", "456", False), ("facebook", "789", False)]
-        assert all(a.brand_id == 1 and a.token_encrypted.startswith("encrypted:") for a in accounts)
+        assert all(a.brand_id == 1 and a.token_encrypted.startswith("gAAAA") for a in accounts)
+        assert [credential_secrets.decrypt(a.token_encrypted) for a in accounts] == [
+            "page-token-a", "page-token-a", "system-user-token"]
+        assert [a.config["name"] for a in accounts] == ["Page A", "ig_a", "Page B"]
+        assert all(a.config["token_status"] == "healthy" for a in accounts)
+        assert [c[0] for c in calls].count("oauth/access_token") == 1
+        assert not any(c[0] in {"me/permissions", "fb_exchange_token"} for c in calls)
+        assert not any(c[0] in {"123/feed", "456/media", "456/media_publish"} for c in calls)
+        assert not any(secret in caplog.text for secret in ["app-secret", "authorization-code", "system-user-token", "page-token-a"])
         assert not db.scalars(select(SystemSetting).where(SystemSetting.key.like("meta_oauth:%"))).first()
         with pytest.raises(DomainError, match="state validation failed"):
-            meta_auth.callback(request, code="code", state=state, admin=admin, db=db)
+            meta_auth.callback(request, code="authorization-code", state=state, admin=admin, db=db)
     engine.dispose()
+
+
+def test_meta_graph_rejects_provider_error_without_logging_credentials(monkeypatch, caplog):
+    monkeypatch.setattr(meta_auth, "settings", lambda: SimpleNamespace(meta_api_version="v23.0"))
+
+    class FailedClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, url, **kwargs):
+            assert kwargs["params"]["client_secret"] == "private-app-secret"
+            return httpx.Response(400, json={"error": {"message": "secret private-app-secret code private-code"}})
+
+    monkeypatch.setattr(meta_auth.httpx, "Client", FailedClient)
+    with pytest.raises(ProviderError, match="Meta rejected authorization") as caught:
+        meta_auth.graph("oauth/access_token", params={"client_secret": "private-app-secret", "code": "private-code"})
+    assert "private-app-secret" not in str(caught.value) + caplog.text
+    assert "private-code" not in str(caught.value) + caplog.text
+
+
+def test_meta_callback_access_log_redacts_authorization_code():
+    record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                               ("127.0.0.1", "GET", "/api/meta/callback?code=private-code&state=private-state", "1.1", 303), None)
+    assert MetaCallbackAccessFilter().filter(record)
+    assert "private-code" not in record.getMessage()
+    assert "private-state" not in record.getMessage()
 
 
 def test_public_media_fails_closed_for_approved_images_only(tmp_path, monkeypatch):

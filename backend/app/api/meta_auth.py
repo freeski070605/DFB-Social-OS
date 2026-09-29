@@ -19,14 +19,14 @@ from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 
 router = APIRouter(prefix="/api", tags=["meta"])
-SCOPES = ("pages_show_list", "pages_read_engagement", "pages_manage_posts", "instagram_basic",
-          "instagram_content_publish", "pages_manage_engagement", "instagram_manage_comments")
 
 
 def configured():
     cfg = settings()
     if not cfg.meta_app_id or not cfg.meta_app_secret or not cfg.meta_redirect_uri.startswith("https://"):
         raise DomainError("Set DFB_META_APP_ID, DFB_META_APP_SECRET, and an HTTPS DFB_META_REDIRECT_URI in .env")
+    if not cfg.meta_config_id:
+        raise DomainError("Set DFB_META_CONFIG_ID for Facebook Login for Business in .env")
     if not cfg.encryption_key:
         raise DomainError("Set DFB_ENCRYPTION_KEY before connecting Meta")
     return cfg
@@ -98,7 +98,8 @@ def start_connection(brand_id: int, request: Request, admin=Depends(authenticate
     record(db, "meta.connect_start", brand_id, brand_id, admin.username)
     db.commit()
     params = {"client_id": cfg.meta_app_id, "redirect_uri": cfg.meta_redirect_uri, "state": state,
-              "response_type": "code", "scope": ",".join(SCOPES)}
+              "response_type": "code", "override_default_response_type": "true",
+              "config_id": cfg.meta_config_id}
     return {"authorization_url": "https://www.facebook.com/" + cfg.meta_api_version + "/dialog/oauth?" + urlencode(params)}
 
 
@@ -114,31 +115,29 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
     db.commit()  # The state is one use, including when Meta returns an error.
     if error or not code:
         raise DomainError("Meta authorization was cancelled or denied. Start connection again.", 400)
-    short = graph("oauth/access_token", params={"client_id": cfg.meta_app_id, "client_secret": cfg.meta_app_secret,
-                                                   "redirect_uri": cfg.meta_redirect_uri, "code": code})["access_token"]
-    exchanged = graph("oauth/access_token", params={"grant_type": "fb_exchange_token", "client_id": cfg.meta_app_id,
-                                                       "client_secret": cfg.meta_app_secret, "fb_exchange_token": short})
-    user_token = exchanged["access_token"]
-    permissions = graph("me/permissions", token=user_token).get("data", [])
-    granted = sorted(p["permission"] for p in permissions if p.get("status") == "granted" and p.get("permission"))
-    for existing in db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
-                                                              PlatformAccount.platform.in_(["facebook", "instagram"]))):
-        existing.enabled = False
+    # A system-user configuration returns the usable token directly from the code exchange.
+    # The user-token long-lived exchange is not valid for this credential type.
+    credential = graph("oauth/access_token", params={"client_id": cfg.meta_app_id, "client_secret": cfg.meta_app_secret,
+                                                     "redirect_uri": cfg.meta_redirect_uri, "code": code})["access_token"]
+    credential_meta = token_metadata(credential)
+    if not credential_meta["valid"]:
+        raise ProviderError("Meta returned an invalid credential. Reconnect this account.")
+    granted = sorted(credential_meta.get("scopes", []))
     after = None
     connected = 0
     for _ in range(10):
         params = {"fields": "id,name,access_token,tasks,instagram_business_account", "limit": 100}
         if after:
             params["after"] = after
-        page = graph("me/accounts", token=user_token, params=params)
+        page = graph("me/accounts", token=credential, params=params)
         for found in page.get("data", []):
-            page_id, page_token = str(found.get("id", "")), found.get("access_token", "")
-            if not page_id.isdigit() or not page_token:
+            page_id, page_token = str(found.get("id", "")), found.get("access_token") or credential
+            if not page_id.isdigit():
                 continue
             meta = token_metadata(page_token)
             if not meta["valid"]:
                 continue
-            common = {"source": "oauth", "page_id": page_id, "permissions": granted,
+            common = {"source": "oauth", "page_id": page_id, "permissions": meta.get("scopes", granted),
                       "tasks": found.get("tasks", []), "expires_at": meta["expires_at"],
                       "data_access_expires_at": meta["data_access_expires_at"], "token_status": "healthy",
                       "token_type": meta.get("token_type", ""),
@@ -168,6 +167,10 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         if not page.get("data") or not cursor or cursor == after:
             break
         after = cursor
+    if connected:
+        for existing in db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
+                                                                  PlatformAccount.platform.in_(["facebook", "instagram"]))):
+            existing.enabled = False
     record(db, "meta.connect_complete", brand_id, brand_id, admin.username, details={"accounts": connected})
     db.commit()
     return RedirectResponse(f"/?meta_connected={brand_id}&count={connected}", status_code=303)

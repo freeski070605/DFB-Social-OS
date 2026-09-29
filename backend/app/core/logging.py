@@ -1,6 +1,7 @@
 import json
 import logging
 from logging.handlers import RotatingFileHandler
+from urllib.parse import urlsplit
 from app.core.config import ROOT
 from app.db.session import utcnow
 
@@ -15,6 +16,18 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(result)
 
 
+class MetaCallbackAccessFilter(logging.Filter):
+    def filter(self, record):
+        # Uvicorn's access record includes the full path and query as argument 3.
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            path = record.args[2]
+            if isinstance(path, str) and urlsplit(path).path == "/api/meta/callback":
+                args = list(record.args)
+                args[2] = "/api/meta/callback"
+                record.args = tuple(args)
+        return True
+
+
 def configure():
     (ROOT / "logs").mkdir(exist_ok=True)
     handler = RotatingFileHandler(ROOT / "logs/dfb.jsonl", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
@@ -23,3 +36,8 @@ def configure():
     if not log.handlers:
         log.addHandler(handler)
     log.setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(item, MetaCallbackAccessFilter) for item in access.filters):
+        access.addFilter(MetaCallbackAccessFilter())
