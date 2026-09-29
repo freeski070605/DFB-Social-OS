@@ -23,7 +23,11 @@ def render_content(db, brand_id, content_id, actor="admin"):
         if not data.get("title", "").strip():
             raise DomainError(f"Slide {i + 1} title is required before rendering")
         slide = Slide.model_validate({**data, "items": [value for value in data.get("items", []) if value.strip()]})
-        v = Visual.model_validate(templates[slide.kind].config) if slide.kind in templates else visual
+        token_values = visual.model_dump()
+        if slide.kind in templates:
+            token_values.update({key: value for key, value in templates[slide.kind].config.items()
+                                 if key in {"background", "foreground", "accent", "muted"}})
+        v = Visual.model_validate(token_values)
         images.append(render_slide(slide, v, i + 1, len(item.slides)))
     storage, assets = LocalStorage(), []
     for i, data in enumerate(images):

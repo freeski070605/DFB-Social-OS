@@ -25,5 +25,5 @@ def seed(db):
         data = BrandInput.model_validate(json.loads(path.read_text(encoding="utf-8")))
         if not db.scalar(select(Brand).where(Brand.slug == data.slug)):
             brand = save_brand(db, data, actor="system")
-            for kind in ("checklist", "steps", "two_column", "do_dont", "statement", "tip", "cover", "end"):
+            for kind in ("checklist", "steps", "two_column", "do_dont", "statement", "tip", "cover", "end", "numbered_action"):
                 db.add(Template(brand_id=brand.id, name=kind.replace("_", " ").title(), kind=kind, config=BrandConfig.model_validate(brand.config).visual.model_dump()))

@@ -6,7 +6,7 @@ from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ValidationError
 from app.core.config import settings
 from app.core.errors import ProviderError
-from app.schemas.domain import AIConfig, GeneratedContent
+from app.schemas.domain import AIConfig, GeneratedContent, EditorialPlan
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -36,7 +36,12 @@ class LocalAIProvider:
                   "Use only supplied approved knowledge for factual claims; omit unsupported claims. "
                   "Do not supply personalized medical, legal or investment advice. " + instruction)
         output_schema = schema.model_json_schema()
+        if schema is EditorialPlan and context.get("expected_points"):
+            count = context["expected_points"]
+            output_schema["properties"]["selected_points"].update(minItems=count, maxItems=count)
+            output_schema["properties"]["recommended_layout_sequence"].update(minItems=count + 1, maxItems=count + 1)
         if schema is GeneratedContent:
+            output_schema["properties"]["caption"].update(minLength=90, maxLength=500)
             requested_format = context.get("request", {}).get("format")
             if requested_format:
                 output_schema["properties"]["format"]["enum"] = [requested_format]

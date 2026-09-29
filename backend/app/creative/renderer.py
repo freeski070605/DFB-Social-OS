@@ -1,3 +1,5 @@
+"""Deterministic portrait graphics with explicit phone-readable text budgets."""
+
 from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 from app.core.config import ROOT
@@ -14,7 +16,9 @@ def font(size):
     return ImageFont.truetype(str(FONT), size)
 
 
-def fit_text(draw, value, box, maximum=60, minimum=26, color="#183C36"):
+def fit_text(draw, value, box, maximum=60, minimum=38, color="#183C36"):
+    if not value.strip():
+        return 0
     x, y, w, h = box
     for size in range(maximum, minimum - 1, -2):
         face, lines = font(size), []
@@ -27,58 +31,121 @@ def fit_text(draw, value, box, maximum=60, minimum=26, color="#183C36"):
                     break
                 candidate = (line + " " + word).strip()
                 if draw.textlength(candidate, font=face) > w:
-                    lines.append(line)
+                    if line:
+                        lines.append(line)
                     line = word
                 else:
                     line = candidate
             lines.append(line)
-        spacing = int(size * 1.4)
+        spacing = int(size * 1.38)
         if valid and len(lines) * spacing <= h:
             for i, line in enumerate(lines):
                 draw.text((x, y + i * spacing), line, font=face, fill=color, anchor="lt")
             return len(lines) * spacing
-    raise DomainError("Slide text cannot fit safely. Shorten text or split it into more slides.")
+    raise DomainError("Slide text exceeds the phone-readable area. Shorten it or split the idea into slides.")
+
+
+def validate_budget(slide):
+    limits = {"cover": (115, 220), "numbered_action": (75, 210), "checklist": (78, 140),
+              "steps": (78, 140), "statement": (110, 230), "end": (100, 230)}
+    title_limit, body_limit = limits.get(slide.kind, (85, 190))
+    if len(slide.title.strip()) > title_limit:
+        raise DomainError(f"{slide.kind.replace('_', ' ').title()} title is too long for phone reading ({title_limit} characters max)")
+    if len(slide.body.strip()) > body_limit:
+        raise DomainError(f"{slide.kind.replace('_', ' ').title()} explanation is too long for phone reading ({body_limit} characters max)")
+    if len(slide.items) > 4 or any(len(value.strip()) > 65 for value in slide.items):
+        raise DomainError("Use at most four short list items of 65 characters each on one slide")
+
+
+def _footer(draw, visual, index, total, inverse=False):
+    ink = visual.background if inverse else visual.foreground
+    faint = visual.background if inverse else visual.muted
+    if visual.border_treatment == "line":
+        draw.line((MARGIN, 1215, WIDTH - MARGIN, 1215), fill=faint, width=2)
+    if visual.footer_treatment == "mark":
+        fit_text(draw, visual.mark or "PRACTICAL NOTES", (MARGIN, 1242, 700, 52), 24, 20, faint)
+    draw.text((WIDTH - MARGIN, 1245), f"{index:02d} / {total:02d}", font=font(25), fill=ink, anchor="rt")
+
+
+def _items(draw, values, y, visual):
+    row_height = 105 if len(values) > 3 else 128
+    if y + len(values) * row_height > 1180:
+        raise DomainError("List items exceed the safe slide area. Shorten them or use fewer items.")
+    for number, value in enumerate(values, start=1):
+        cy = y + (number - 1) * row_height
+        draw.rounded_rectangle((MARGIN, cy + 8, MARGIN + 48, cy + 56), radius=14, fill=visual.accent)
+        draw.text((MARGIN + 24, cy + 30), str(number), font=font(26), fill=visual.foreground, anchor="mm")
+        fit_text(draw, value, (MARGIN + 76, cy, 825, row_height - 10), 44, 36, visual.foreground)
 
 
 def render_slide(slide: Slide, visual: Visual, index=1, total=1):
-    canvas = Image.new("RGB", (WIDTH, HEIGHT), visual.background)
+    validate_budget(slide)
+    inverse = slide.kind == "end"
+    background = visual.foreground if inverse else visual.background
+    ink = visual.background if inverse else visual.foreground
+    canvas = Image.new("RGB", (WIDTH, HEIGHT), background)
     draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle((84, 68, 996, 76), radius=4, fill=visual.accent)
-    fit_text(draw, visual.mark, (84, 104, 780, 70), 24, 18, visual.muted)
-    title_y = 260 if slide.kind in {"cover", "end"} else 225
-    used = fit_text(draw, slide.title, (84, title_y, 912, 330), 86 if slide.kind == "cover" else 66, 38, visual.foreground)
-    y = max(540, title_y + used + 60)
-    bottom = 1160
-    if slide.kind in {"two_column", "do_dont"}:
-        values = slide.items or slide.body.split("\n\n")
+    radius = visual.corner_radius
+    scale = visual.spacing_scale
+    draw.rounded_rectangle((MARGIN, 68, WIDTH - MARGIN, 79), radius=5, fill=visual.accent)
+    if slide.kind == "cover":
+        draw.rounded_rectangle((MARGIN, 170, WIDTH - MARGIN, 1110), radius=radius + 12, fill=visual.foreground)
+        draw.rounded_rectangle((MARGIN + 38, 207, MARGIN + 265, 263), radius=20, fill=visual.accent)
+        fit_text(draw, "SAVEABLE GUIDE", (MARGIN + 59, 220, 190, 36), 22, 20, visual.foreground)
+        used = fit_text(draw, slide.title, (MARGIN + 45, 332, 822, 455), 91, 58, visual.background)
+        fit_text(draw, slide.body, (MARGIN + 48, max(815, 332 + used + 35), 804, 230), 44, 36, visual.background)
+        _footer(draw, visual, index, total)
+    elif slide.kind == "numbered_action":
+        draw.rounded_rectangle((MARGIN, 168, MARGIN + 187, 344), radius=radius, fill=visual.accent)
+        draw.text((MARGIN + 92, 256), f"{index - 1:02d}", font=font(104), fill=visual.foreground, anchor="mm")
+        used = fit_text(draw, slide.title, (MARGIN, 395, 910, 275), 78, 54, visual.foreground)
+        y = max(700, 395 + used + int(36 * scale))
+        body_used = fit_text(draw, slide.body, (MARGIN, y, 900, 275), 50, 40, visual.foreground)
+        if slide.items:
+            panel_y = max(930, y + body_used + 35)
+            if panel_y + 58 * len(slide.items) > 1170:
+                raise DomainError("Numbered action has too much explanation and list detail for one slide")
+            draw.rounded_rectangle((MARGIN, panel_y - 18, WIDTH - MARGIN, 1185), radius=radius, fill=visual.accent)
+            for n, value in enumerate(slide.items):
+                fit_text(draw, "• " + value, (MARGIN + 36, panel_y + n * 57, 820, 55), 35, 32, visual.foreground)
+        _footer(draw, visual, index, total)
+    elif slide.kind in {"checklist", "steps"}:
+        fit_text(draw, slide.title, (MARGIN, 203, 900, 250), 72, 52, ink)
+        values = slide.items or [line.strip() for line in slide.body.splitlines() if line.strip()]
+        if not values:
+            raise DomainError("Checklist and step slides require short list items")
+        if slide.items and slide.body.strip():
+            fit_text(draw, slide.body, (MARGIN, 456, 900, 176), 48, 39, ink)
+            _items(draw, values, 690, visual)
+        else:
+            _items(draw, values, 545, visual)
+        _footer(draw, visual, index, total)
+    elif slide.kind in {"statement", "tip", "end"}:
+        draw.rounded_rectangle((MARGIN, 225, MARGIN + 22, 1080), radius=10, fill=visual.accent)
+        used = fit_text(draw, slide.title, (MARGIN + 65, 300, 835, 380), 82, 54, ink)
+        fit_text(draw, slide.body, (MARGIN + 65, max(730, 300 + used + 50), 830, 325), 50, 40, ink)
+        if slide.items:
+            raise DomainError("Statement slides should have one focused thought; move list items to a checklist")
+        _footer(draw, visual, index, total, inverse=inverse)
+    elif slide.kind in {"two_column", "do_dont"}:
+        fit_text(draw, slide.title, (MARGIN, 195, 900, 240), 70, 50, ink)
+        values = slide.items or [part.strip() for part in slide.body.split("\n\n") if part.strip()]
         if len(values) < 2:
-            raise DomainError("Two-column templates require at least two items")
+            raise DomainError("Two-column slides require at least two short items")
         middle = (len(values) + 1) // 2
         for col, group in enumerate((values[:middle], values[middle:])):
-            x = 84 + col * 478
-            draw.rounded_rectangle((x, y, x + 434, bottom), radius=24, fill=visual.accent if col == 0 else visual.foreground)
-            label = ("DO" if col == 0 else "AVOID") + "\n\n" if slide.kind == "do_dont" else ""
-            fit_text(draw, label + "\n\n".join(group), (x + 28, y + 30, 378, bottom - y - 60), 38, 26, visual.foreground if col == 0 else visual.background)
-    elif slide.kind in {"checklist", "steps"}:
-        values = slide.items or slide.body.splitlines()
-        if not values:
-            raise DomainError("Checklist and step slides require items")
-        row_height = (bottom - y) // len(values)
-        if row_height < 58:
-            raise DomainError("Too many items on slide")
-        for i, value in enumerate(values):
-            cy = y + i * row_height
-            draw.rounded_rectangle((84, cy + 3, 132, cy + 51), radius=12, fill=visual.accent)
-            draw.text((98, cy + 11), str(i + 1) if slide.kind == "steps" else "+", font=font(24), fill=visual.foreground)
-            fit_text(draw, value, (158, cy, 838, row_height - 14), 42, 26, visual.foreground)
+            x = MARGIN + col * 468
+            fill = visual.accent if col == 0 else visual.foreground
+            draw.rounded_rectangle((x, 520, x + 438, 1125), radius=radius, fill=fill)
+            prefix = ("DO\n" if col == 0 else "AVOID\n") if slide.kind == "do_dont" else ""
+            fit_text(draw, prefix + "\n".join(group), (x + 30, 563, 380, 520), 44, 35,
+                     visual.foreground if col == 0 else visual.background)
+        _footer(draw, visual, index, total)
     else:
-        text = slide.body + ("\n\n" if slide.body and slide.items else "") + "\n".join(slide.items)
-        if slide.kind == "tip":
-            draw.rounded_rectangle((64, y - 24, 1016, bottom + 16), radius=32, fill=visual.accent)
-        fit_text(draw, text, (84, y, 912, bottom - y), 46, 28, visual.foreground)
-    draw.line((84, 1220, 996, 1220), fill=visual.muted, width=1)
-    draw.text((84, 1254), "PRACTICAL NOTES" if visual.mark == "DFB / FIELD NOTES" else visual.mark[:35], font=font(20), fill=visual.muted)
-    draw.text((996, 1254), f"{index:02d} / {total:02d}", font=font(22), fill=visual.foreground, anchor="rt")
+        fit_text(draw, slide.title, (MARGIN, 230, 900, 300), 74, 52, ink)
+        fit_text(draw, slide.body + ("\n" + "\n".join(slide.items) if slide.items else ""),
+                 (MARGIN, 620, 900, 500), 50, 38, ink)
+        _footer(draw, visual, index, total)
     output = BytesIO()
     canvas.save(output, format="PNG", optimize=True)
     return output.getvalue()

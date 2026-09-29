@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field, ConfigDict, field_validator, model_valida
 
 Mode = Literal["AUTO", "APPROVAL", "MANUAL"]
 Format = Literal["carousel", "single_graphic", "checklist", "steps", "do_dont", "comparison", "tip", "story", "reel_script", "short_video_script", "text_post"]
-TemplateKind = Literal["checklist", "steps", "two_column", "do_dont", "statement", "tip", "cover", "end"]
+TemplateKind = Literal["checklist", "steps", "two_column", "do_dont", "statement", "tip", "cover", "end", "numbered_action"]
 
 
 class StrictModel(BaseModel):
@@ -17,7 +17,13 @@ class Visual(StrictModel):
     foreground: str = "#183C36"
     accent: str = "#D9F075"
     muted: str = "#65726A"
-    mark: str = "DFB / FIELD NOTES"
+    mark: str = "PRACTICAL NOTES"
+    headline_font: Literal["Manrope"] = "Manrope"
+    body_font: Literal["Manrope"] = "Manrope"
+    corner_radius: int = Field(default=28, ge=0, le=80)
+    border_treatment: Literal["line", "none"] = "line"
+    spacing_scale: float = Field(default=1, ge=0.8, le=1.3)
+    footer_treatment: Literal["mark", "minimal"] = "mark"
 
     @field_validator("background", "foreground", "accent", "muted")
     @classmethod
@@ -69,6 +75,20 @@ class AIConfig(StrictModel):
     temperature: float = Field(default=0.5, ge=0, le=1)
 
 
+class EditorialVoice(StrictModel):
+    description: str = "Useful, clear, natural and accurate"
+    reading_style: str = "Plain language"
+    sentence_length: str = "Short to medium"
+    hook_styles: list[str] = Field(default_factory=lambda: ["Specific promise", "Useful observation"], max_length=8)
+    cta_style: str = "Natural invitation, only when useful"
+    banned_phrases: list[str] = Field(default_factory=list, max_length=50)
+    emoji_policy: Literal["none", "sparingly", "allowed"] = "sparingly"
+    hashtag_policy: Literal["none", "separate", "allowed"] = "separate"
+    humor_level: Literal["none", "light", "playful"] = "light"
+    directness: Literal["gentle", "balanced", "direct"] = "balanced"
+    formatting_preferences: str = "Short headlines and concise explanations"
+
+
 class InteractionRules(StrictModel):
     min_confidence: float = Field(default=0.9, ge=0.8, le=1)
     max_replies_hour: int = Field(default=10, ge=1, le=60)
@@ -81,6 +101,7 @@ class BrandConfig(StrictModel):
     voice: str = "Clear, practical, warm and accurate"
     tone: str = "Helpful without judgment"
     audience: str = ""
+    editorial: EditorialVoice = Field(default_factory=EditorialVoice)
     pillars: list[str] = Field(default_factory=list, max_length=50)
     prohibited_topics: list[str] = Field(default_factory=list)
     terminology: list[str] = Field(default_factory=list)
@@ -156,6 +177,30 @@ class GeneratedContent(ContentInput):
         if self.format in {"carousel", "checklist", "steps", "do_dont", "comparison", "single_graphic", "tip", "story"} and not self.slides:
             raise ValueError("Generated graphic content needs at least one slide")
         return self
+
+
+class EditorialPoint(StrictModel):
+    headline: str = Field(min_length=3, max_length=120)
+    action: str = Field(min_length=8, max_length=320)
+    support_ids: list[int] = Field(min_length=1, max_length=8)
+    items: list[str] = Field(default_factory=list, max_length=4)
+
+
+class RejectedPoint(StrictModel):
+    point: str = Field(max_length=180)
+    reason: Literal["duplicate", "off_topic", "weak", "unsupported"]
+
+
+class EditorialPlan(StrictModel):
+    audience_promise: str = Field(min_length=8, max_length=300)
+    content_goal: str = Field(min_length=8, max_length=300)
+    angle: str = Field(min_length=5, max_length=220)
+    candidate_points: list[str] = Field(default_factory=list, max_length=20)
+    selected_points: list[EditorialPoint] = Field(min_length=1, max_length=15)
+    rejected_points: list[RejectedPoint] = Field(default_factory=list, max_length=20)
+    desired_slide_count: int = Field(ge=2, le=20)
+    recommended_layout_sequence: list[TemplateKind] = Field(min_length=2, max_length=20)
+    caption_direction: str = Field(min_length=8, max_length=300)
 
 
 class GenerationInput(StrictModel):
