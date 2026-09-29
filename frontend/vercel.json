@@ -1,8 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rewrites": [
-    {"source": "/api/:path*", "destination": "https://social-api.dfbsolutions.co/api/:path*"},
-    {"source": "/health", "destination": "https://social-api.dfbsolutions.co/health"},
+    {"source": "/api/:path*", "destination": "/api/proxy?backend_path=api/:path*"},
+    {"source": "/health", "destination": "/api/proxy?backend_path=health"},
     {"source": "/(.*)", "destination": "/index.html"}
   ],
   "headers": [

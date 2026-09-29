@@ -2,7 +2,7 @@
 
 ## Architecture and existing behavior
 
-The recommended public browser origin is `https://social.dfbsolutions.co`. Vercel serves the Vite build and rewrites `/api/*` and `/health` to the permanent Cloudflare Tunnel origin, `https://social-api.dfbsolutions.co`. Cloudflare Tunnel forwards only those paths to FastAPI at `http://127.0.0.1:8000`. SQLite, scheduler, workers, Ollama, media, DFB AI Studio, encryption keys, and provider credentials stay on the Windows PC.
+The recommended public browser origin is `https://social.dfbsolutions.co`. Vercel serves the Vite build and routes `/api/*` and `/health` through a server-side proxy to the Cloudflare Tunnel origin configured by `BACKEND_ORIGIN`. The permanent tunnel origin is `https://social-api.dfbsolutions.co`; a temporary `trycloudflare.com` origin can be used for a mobile access test. Cloudflare Tunnel forwards those paths to FastAPI at `http://127.0.0.1:8000`. SQLite, scheduler, workers, Ollama, media, DFB AI Studio, encryption keys, and provider credentials stay on the Windows PC.
 
 The frontend currently uses relative `/api` URLs and includes credentials. `VITE_API_BASE_URL` is optional and defaults to empty; **leave it empty in the recommended deployment**. Local Vite proxies `/api` and `/health` to FastAPI. FastAPI also serves a built frontend locally, including its SPA fallback. Vercel serves the frontend independently and provides its own SPA fallback.
 
@@ -10,18 +10,18 @@ Sessions use a host-only `dfb_session` cookie (no `Domain`), `HttpOnly`, `SameSi
 
 The OAuth redirect URI is taken verbatim from the local `.env`; changing this repository does not change it. The permanent callbacks below use the **browser origin** so the same host-only session cookie reaches the callback. A callback to `social-api.dfbsolutions.co` would not carry a cookie created on `social.dfbsolutions.co`.
 
-The tunnel API hostname is publicly routable. FastAPI authentication, CSRF checks, and origin checks still apply there. Cloudflare ingress rules limit it to `/api/*` and `/health`. The Vercel rewrite must be checked on the deployed domain before switching OAuth callback registrations: verify that `Set-Cookie` stays host-only on `social.dfbsolutions.co`, login works, CSRF protected mutations work, and callback requests reach FastAPI with that session cookie. Vercel's external rewrite preserves the browser URL and does not cache external-origin responses unless cache headers allow it; the backend sends `no-store` for API and health responses. See [Vercel rewrites](https://vercel.com/docs/routing/rewrites).
+The tunnel API hostname is publicly routable. FastAPI authentication, CSRF checks, and origin checks still apply there. Cloudflare ingress rules limit it to `/api/*` and `/health`. Check the Vercel proxy on the deployed domain before switching OAuth callback registrations: verify that `Set-Cookie` stays host-only on the browser origin, login works, CSRF protected mutations work, and callback requests reach FastAPI with that session cookie. The proxy preserves the browser URL and sends `Cache-Control: no-store` for API and health responses. OAuth callback configuration is unchanged by this setup.
 
 ## Vercel deployment
 
 1. Put this repository in your Git provider. In Vercel, import it as a **Vite** project and set **Root Directory** to `frontend`.
 2. Use `npm run build` as the build command and `dist` as the output directory. Vercel installs from `frontend/package-lock.json`.
-3. Do not add backend secrets to Vercel. No Vercel environment variables are required. Leave `VITE_API_BASE_URL` unset or empty. Only public `VITE_*` values are bundled, and no provider credentials belong there.
+3. Set the server-side Vercel environment variable `BACKEND_ORIGIN` to the HTTPS Cloudflare Tunnel origin with no path or trailing slash. Set it for Production and redeploy; environment variable changes do not affect existing deployments. Leave `VITE_API_BASE_URL` unset or empty. Do not add backend secrets or provider credentials to Vercel.
 4. Attach `social.dfbsolutions.co` to the Vercel project and follow Vercel's displayed DNS instructions for that hostname. The Cloudflare Tunnel hostname below uses a separate DNS record.
 5. Turn on HTTPS and ensure the production domain resolves. Keep preview deployments protected or use only the production hostname for admin work: the production CORS list and OAuth redirect URIs are intentionally exact.
 6. After the tunnel is running, check `https://social.dfbsolutions.co/health` returns `{"status":"ok"}`. Then test login, sign out, and a harmless authenticated read. An unavailable PC or tunnel shows **Local backend offline**; the frontend shell may still load.
 
-The checked-in `frontend/vercel.json` is fixed to `social-api.dfbsolutions.co`. If a different permanent tunnel hostname is chosen, edit its two rewrite destinations before deploying. Never point it to a temporary `trycloudflare.com` URL.
+The checked-in `frontend/vercel.json` routes `/api/*` and `/health` to one Vercel Function. The function reads `BACKEND_ORIGIN` on the server and forwards requests to that origin. For a temporary mobile test, set `BACKEND_ORIGIN` to the active `trycloudflare.com` URL; set it back to the permanent tunnel origin and redeploy when the test ends. The temporary URL is not included in the frontend build.
 
 ## Named Cloudflare Tunnel on Windows
 
