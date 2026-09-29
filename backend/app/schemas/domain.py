@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 from zoneinfo import ZoneInfo
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 Mode = Literal["AUTO", "APPROVAL", "MANUAL"]
 Format = Literal["carousel", "single_graphic", "checklist", "steps", "do_dont", "comparison", "tip", "story", "reel_script", "short_video_script", "text_post"]
@@ -151,6 +151,12 @@ class GeneratedContent(ContentInput):
     caption: str = Field(min_length=1, max_length=2200)
     slides: list[Slide] = Field(default_factory=list, max_length=20)
 
+    @model_validator(mode="after")
+    def graphic_slides_required(self):
+        if self.format in {"carousel", "checklist", "steps", "do_dont", "comparison", "single_graphic", "tip", "story"} and not self.slides:
+            raise ValueError("Generated graphic content needs at least one slide")
+        return self
+
 
 class GenerationInput(StrictModel):
     topic: str = Field(min_length=3, max_length=300)
@@ -158,6 +164,7 @@ class GenerationInput(StrictModel):
     format: Format = "carousel"
     parent_id: int | None = None
     knowledge_refs: list[int] = Field(default_factory=list, max_length=8)
+    update_current: bool = False
 
 
 class ScheduleInput(StrictModel):

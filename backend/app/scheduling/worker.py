@@ -68,7 +68,10 @@ def execute(db, job):
     elif job.kind == "director":
         maintain(db, brand.id)
     elif job.kind == "generate":
-        generate(db, brand.id, GenerationInput.model_validate(job.payload), "system")
+        request = GenerationInput.model_validate({key: value for key, value in job.payload.items() if not key.startswith("_")})
+        item = generate(db, brand.id, request, "system", job.payload.get("_editor_target_id"),
+                        job.payload.get("_expected_revision"))
+        job.target_id = item.id
     elif job.kind == "classify":
         classify(db, brand.id, job.target_id)
     elif job.kind == "reply":

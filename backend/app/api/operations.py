@@ -121,6 +121,11 @@ def jobs(brand_id: int, db=Depends(get_db)):
     return [serialize(x) for x in list_brand(db, Job, brand_id, 500)]
 
 
+@router.get("/jobs/{key}")
+def job_get(brand_id: int, key: int, db=Depends(get_db)):
+    return serialize(require(db, Job, key, brand_id))
+
+
 @router.post("/jobs/{key}/{action}")
 def change_job(brand_id: int, key: int, action: str, admin=Depends(authenticated), db=Depends(get_db)):
     job = job_action(db, brand_id, key, action, admin.username)

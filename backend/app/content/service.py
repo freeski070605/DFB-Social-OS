@@ -3,7 +3,7 @@ from difflib import SequenceMatcher
 from sqlalchemy import select
 from app.models import Content, Brand, Knowledge, Job, Approval
 from app.schemas.domain import ContentInput, GeneratedContent, BrandConfig
-from app.repositories.common import require, serialize
+from app.repositories.common import require
 from app.audit.service import record
 from app.core.errors import DomainError
 from app.knowledge.bulk import normalized
@@ -137,12 +137,19 @@ def similarity(a, b):
     return max(SequenceMatcher(None, a, b).ratio(), len(aa & bb) / max(1, len(aa | bb)))
 
 
-def generate(db, brand_id, request, actor="admin"):
+def generate(db, brand_id, request, actor="admin", target_id=None, expected_revision=None):
     brand = require(db, Brand, brand_id)
     config = BrandConfig.model_validate(brand.config)
     if not brand.enabled:
         raise DomainError("Enable the brand before generating content")
     parent = require(db, Content, request.parent_id, brand_id) if request.parent_id else None
+    if target_id:
+        if not parent or parent.id != target_id or parent.status != "DRAFT":
+            raise DomainError("The draft is no longer available for generation", 409)
+        if parent.revision != expected_revision:
+            raise DomainError("Draft changed after generation was requested. Review and try again.", 409)
+        if (parent.topic, parent.pillar, parent.format) != (request.topic, request.pillar, request.format):
+            raise DomainError("Generation request no longer matches the saved draft", 409)
     request.pillar = canonical_pillar(db, brand_id, request.pillar)
     refs = generation_candidates(db, brand_id, request.topic, request.pillar, request.knowledge_refs)
     if not refs:
@@ -152,18 +159,27 @@ def generate(db, brand_id, request, actor="admin"):
         raise DomainError("A similar topic already exists. Repurpose it or choose a different topic.", 409)
     output = provider(config.ai).generate(
         "Create useful, original content. Respect knowledge restrictions. Use the requested topic, pillar and format. "
-        "Use short readable slides, cover first and end last. Cite only supplied knowledge IDs. "
+        "For a carousel, provide a cover slide and substantive slides with titles and explanations. "
+        "Use short readable slides, cover first and end last. Include only supplied knowledge IDs in knowledge_refs. "
         "Never invent sources. Do not repeat recent topics. Captions must avoid engagement bait.",
         {"brand": config.model_dump(), "request": request.model_dump(), "knowledge": [
             {"id": k.id, "title": k.title, "body": k.body[:8000], "source": k.source, "restrictions": k.restrictions} for k in refs],
-         "recent_topics": [c.topic for c in recent[:30]], "parent": serialize(parent) if parent else None}, GeneratedContent)
+         "recent_topics": [c.topic for c in recent[:30]], "parent": {
+             "id": parent.id, "revision": parent.revision, "topic": parent.topic, "pillar": parent.pillar,
+             "format": parent.format, "hook": parent.hook, "body": parent.body, "slides": parent.slides,
+             "caption": parent.caption, "cta": parent.cta, "knowledge_refs": parent.knowledge_refs,
+         } if parent else None}, GeneratedContent)
     if set(output.knowledge_refs) - {k.id for k in refs} or not output.knowledge_refs:
         raise DomainError("Model output has missing or invalid knowledge provenance; regenerate")
     output.topic, output.pillar, output.format = request.topic, request.pillar, request.format
-    output.parent_id, output.targets = request.parent_id, config.platforms
+    output.parent_id = parent.parent_id if target_id else request.parent_id
+    output.targets = parent.targets if target_id else config.platforms
+    if target_id and parent.hook.strip():
+        output.hook = parent.hook
     output.sources = [k.source for k in refs if k.id in output.knowledge_refs and k.source]
-    item = save(db, brand_id, ContentInput.model_validate(output.model_dump()), actor=actor)
+    item = save(db, brand_id, ContentInput.model_validate(output.model_dump()), key=target_id, actor=actor)
     item.generation = {"provider": config.ai.provider, "model": config.ai.model, "knowledge": [
-        {"id": k.id, "updated_at": k.updated_at.isoformat(), "body": k.body, "restrictions": k.restrictions} for k in refs if k.id in output.knowledge_refs]}
+        {"id": k.id, "title": k.title, "source": k.source, "updated_at": k.updated_at.isoformat(),
+         "restrictions": k.restrictions} for k in refs if k.id in output.knowledge_refs]}
     transition(db, item, "REVIEW", actor)
     return item

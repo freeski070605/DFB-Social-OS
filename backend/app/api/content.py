@@ -63,7 +63,15 @@ def generate(brand_id: int, data: GenerationInput, admin=Depends(authenticated),
         raise DomainError("Select and attach approved knowledge before generating")
     if not content_service.generation_candidates(db, brand_id, data.topic, data.pillar, data.knowledge_refs):
         raise DomainError("Approve and enable knowledge for this pillar before AI generation")
-    job = enqueue(db, brand_id, "generate", payload=data.model_dump())
+    payload = data.model_dump()
+    if data.update_current:
+        if not data.parent_id:
+            raise DomainError("Save the draft before updating it with generated content")
+        draft = require(db, Content, data.parent_id, brand_id)
+        if draft.status != "DRAFT" or (draft.topic, draft.pillar, draft.format) != (data.topic, data.pillar, data.format):
+            raise DomainError("Save and review the current draft before generating", 409)
+        payload.update({"_editor_target_id": draft.id, "_expected_revision": draft.revision})
+    job = enqueue(db, brand_id, "generate", target_id=data.parent_id if data.update_current else None, payload=payload)
     record(db, "generation.request", job.id, brand_id, admin.username)
     db.commit()
     return serialize(job)

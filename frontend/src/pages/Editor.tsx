@@ -4,13 +4,13 @@ import {api,brandPath,formats,kinds,label} from '../services/api'
 import {readableError} from '../services/validation'
 import {eligibleCandidates} from '../services/knowledgeCandidates'
 import {Badge,Field,Panel,useAction,Status} from '../components/ui'
-import type {Brand,Content,Knowledge,Slide} from '../types'
+import type {Brand,Content,Job,Knowledge,Slide} from '../types'
 
 type Draft=Pick<Content,'topic'|'pillar'|'format'|'hook'|'body'|'slides'|'caption'|'cta'|'hashtags'|'knowledge_refs'|'sources'|'targets'|'parent_id'>
 const fresh=(brand:Brand):Draft=>({topic:'',pillar:brand.config.pillars[0]||'General',format:'carousel',hook:'',body:'',slides:[{title:'',body:'',kind:'cover',items:[]}],caption:'',cta:'',hashtags:[],knowledge_refs:[],sources:[],targets:brand.config.platforms,parent_id:null})
 const normalized=(value:string)=>value.normalize('NFKC').replace(/\s+/g,' ').trim().toLocaleLowerCase()
 export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navigate:(page:string,id?:number)=>void}) {
- const [draft,setDraft]=useState<Draft>(fresh(brand)),[item,setItem]=useState<Content|null>(null),[candidates,setCandidates]=useState<{key:string;items:Knowledge[];loading:boolean;error:string}>({key:'',items:[],loading:false,error:''}),[when,setWhen]=useState(''),[override,setOverride]=useState(false),[reason,setReason]=useState(''),[tab,setTab]=useState('Write'),[error,setError]=useState('')
+ const [draft,setDraft]=useState<Draft>(fresh(brand)),[item,setItem]=useState<Content|null>(null),[candidates,setCandidates]=useState<{key:string;items:Knowledge[];loading:boolean;error:string}>({key:'',items:[],loading:false,error:''}),[when,setWhen]=useState(''),[override,setOverride]=useState(false),[reason,setReason]=useState(''),[tab,setTab]=useState('Write'),[error,setError]=useState(''),[generationStatus,setGenerationStatus]=useState('')
  const {busy,run}=useAction(),path=(suffix:string)=>brandPath(brand.id,suffix)
  const candidateKey=JSON.stringify([brand.id,draft.topic,draft.pillar])
  const knowledge=candidates.key===candidateKey?eligibleCandidates(candidates.items,brand.id,draft.pillar):[]
@@ -26,20 +26,37 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
  async function save(){setError('');try{const slides=draft.slides.filter((slide,index)=>!(index===0&&slide.kind==='cover'&&!slide.title.trim()&&!slide.body.trim()&&slide.items.every(value=>!value.trim())))
   const result=await api<Content>(path(id?`/content/${id}`:'/content'),id?'PUT':'POST',{...draft,slides});setItem(result);if(!id)navigate('Create',result.id);return result
  }catch(reason){const message=`Draft couldn't be saved: ${readableError(reason)}`;setError(message);throw new Error(message)}}
- async function generate(){setError('');try{
+ async function generate(){setError('');setGenerationStatus('');try{
   if(!brand.enabled)throw new Error('Enable this brand before generating')
   if(draft.topic.trim().length<3)throw new Error('Enter a topic of at least 3 characters')
   if(!brand.config.pillars.some(pillar=>normalized(pillar)===normalized(draft.pillar)))throw new Error('Choose a configured pillar for this brand')
+  if(draft.knowledge_refs.length>8)throw new Error('Select up to 8 knowledge records for generation')
+  if(item&&(['topic','pillar','format','hook','body','slides','caption','cta','hashtags','sources','targets'] as const).some(key=>JSON.stringify(draft[key])!==JSON.stringify(item[key])))throw new Error('Save draft changes before generating so the local model receives the current draft')
   const query=new URLSearchParams({topic:draft.topic,pillar:draft.pillar})
   const current=await api<Knowledge[]>(path('/knowledge/candidates?'+query.toString()))
   const eligible=eligibleCandidates(current,brand.id,draft.pillar)
   if(!eligible.length)throw new Error('Approve and enable knowledge for this pillar before generating')
   if(!draft.knowledge_refs.length)throw new Error('Select and attach approved knowledge before generating')
   if(draft.knowledge_refs.some(ref=>!eligible.some(item=>item.id===ref)))throw new Error('Knowledge selection changed. Review the current candidates before generating')
-  await api(path('/generate'),'POST',{topic:draft.topic,pillar:draft.pillar,format:draft.format,parent_id:item?.id||draft.parent_id,knowledge_refs:draft.knowledge_refs});navigate('System')
- }catch(reason){const message=readableError(reason);setError(message);throw new Error(message)}}
+  const queued=await api<Job>(path('/generate'),'POST',{topic:draft.topic,pillar:draft.pillar,format:draft.format,parent_id:item?.id||draft.parent_id,knowledge_refs:draft.knowledge_refs,update_current:item?.status==='DRAFT'})
+  setGenerationStatus('Generating with local AI…')
+  for(let attempt=0;attempt<180;attempt++){
+   await new Promise(resolve=>setTimeout(resolve,2000))
+   const job=await api<Job>(path(`/jobs/${queued.id}`))
+   if(job.status==='DONE'){
+    const result=await api<Content>(path(`/content/${job.target_id}`))
+    if(id===result.id){setItem(result);setDraft({...Object.fromEntries(Object.keys(fresh(brand)).map(key=>[key,result[key as keyof Content]])),slides:result.slides.length?result.slides:fresh(brand).slides} as Draft)}
+    else navigate('Create',result.id)
+    setGenerationStatus('')
+    return
+   }
+   if(['FAILED','CANCELLED','UNKNOWN'].includes(job.status))throw new Error(`Local AI generation failed: ${job.error||job.status.toLowerCase()}`)
+   if(job.status==='PENDING'&&job.error)setGenerationStatus(`Local AI retrying: ${job.error}`)
+  }
+  throw new Error('Local AI generation is still running. Check Jobs for its status.')
+ }catch(reason){setGenerationStatus('');const message=readableError(reason);setError(message);throw new Error(message)}}
  async function action(name:string,body?:unknown){if(!id)throw new Error('Save your draft first');const result=await api<Content>(path(`/content/${id}/${name}`),'POST',body);if(result.topic)setItem(result)}
- return <><div className="toolbar"><div className="grow"><Badge>{item?.status||'NEW DRAFT'}</Badge>{item&&<span className="muted"> Revision {item.revision} · {item.status==='DRAFT'||item.quality.score==null?'Not scored yet':`Quality ${item.quality.score}/100`}</span>}</div><button disabled={busy} onClick={()=>run(save)}><Save size={16}/>Save draft</button><button className="primary" disabled={busy||!draft.topic} onClick={()=>run(generate,'Generation queued')}><Sparkles size={16}/>{id?'Generate variant':'Generate with local AI'}</button></div><Status error={error}/>
+ return <><div className="toolbar"><div className="grow"><Badge>{item?.status||'NEW DRAFT'}</Badge>{item&&<span className="muted"> Revision {item.revision} · {item.status==='DRAFT'||item.quality.score==null?'Not scored yet':`Quality ${item.quality.score}/100`}</span>}</div><button disabled={busy} onClick={()=>run(save)}><Save size={16}/>Save draft</button><button className="primary" disabled={busy||!draft.topic} onClick={()=>run(generate,'Content generated')}><Sparkles size={16}/>{item?.status==='DRAFT'?'Generate draft':id?'Generate variant':'Generate with local AI'}</button></div><Status error={error}/>{generationStatus&&<p role="status" className="notice">{generationStatus}</p>}{error.startsWith('Local AI')&&<button className="text-button" onClick={()=>navigate('System')}>Open System diagnostics</button>}
  <div className="editor-grid"><div><Panel title="The idea"><div className="form-grid"><Field label="Topic"><input value={draft.topic} onChange={e=>field('topic',e.target.value)} placeholder="One useful thing your audience should know"/></Field><Field label="Pillar"><input list="pillars" value={draft.pillar} onChange={e=>field('pillar',e.target.value)}/><datalist id="pillars">{brand.config.pillars.map(p=><option key={p}>{p}</option>)}</datalist></Field><Field label="Format"><select value={draft.format} onChange={e=>field('format',e.target.value)}>{formats.map(f=><option key={f} value={f}>{label(f)}</option>)}</select></Field><Field label="Hook"><textarea rows={2} value={draft.hook} onChange={e=>field('hook',e.target.value)}/></Field></div></Panel>
  <Panel title="Make it useful" action={<div className="segmented">{['Write','Preview'].map(t=><button className={tab===t?'selected':''} key={t} onClick={()=>setTab(t)}>{t}</button>)}</div>}>
  {tab==='Write'?<><Field label="Body / script"><textarea rows={4} value={draft.body} onChange={e=>field('body',e.target.value)}/></Field>{draft.slides.map((s,i)=><div className="slide-editor" key={i}><div className="panel-heading"><strong>Slide {String(i+1).padStart(2,'0')}</strong><button className="icon-button" aria-label={`Remove slide ${i+1}`} onClick={()=>field('slides',draft.slides.filter((_,n)=>n!==i))}><Trash2 size={16}/></button></div><div className="form-grid"><Field label="Layout"><select value={s.kind} onChange={e=>slide(i,{kind:e.target.value})}>{kinds.map(k=><option key={k} value={k}>{label(k)}</option>)}</select></Field><Field label="Title"><input value={s.title} onChange={e=>slide(i,{title:e.target.value})}/></Field></div><Field label="Explanation"><textarea rows={3} value={s.body} onChange={e=>slide(i,{body:e.target.value})}/></Field><Field label="List items / column content" hint="One item per line. Two-column layouts need at least two items."><textarea value={s.items.join('\n')} onChange={e=>slide(i,{items:e.target.value.split('\n')})}/></Field><div className="button-row"><button disabled={i===0} onClick={()=>{const slides=[...draft.slides];[slides[i-1],slides[i]]=[slides[i],slides[i-1]];field('slides',slides)}}>Move up</button><button disabled={i===draft.slides.length-1} onClick={()=>{const slides=[...draft.slides];[slides[i+1],slides[i]]=[slides[i],slides[i+1]];field('slides',slides)}}>Move down</button></div></div>)}<button onClick={()=>field('slides',[...draft.slides,{title:'',body:'',kind:'statement',items:[]}])}><Plus size={16}/>Add slide</button></>:<div className="preview-grid">{item?.assets.length?item.assets.map((a,i)=><a key={a.key} href={'/api/media/'+a.key} target="_blank" rel="noreferrer"><img src={'/api/media/'+a.key} alt={`Rendered slide ${i+1}`}/></a>):<p>Save, then render your graphics to see a faithful preview.</p>}</div>}

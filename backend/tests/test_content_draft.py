@@ -8,10 +8,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.content import service as content_service
+from app.scheduling.worker import execute
+from app.core.errors import DomainError, ProviderError
 from app.db.session import Base, get_db, utcnow
 from app.main import app
 from app.models import Admin, AdminSession, Brand, Content, Job, Knowledge
-from app.schemas.domain import GenerationInput
+from app.schemas.domain import GeneratedContent, GenerationInput
 
 
 @pytest.fixture
@@ -216,3 +218,76 @@ def test_current_topic_ranks_approved_routine_records_first(content_http):
     assert "Inventory before shopping" not in titles
     assert titles[0] == "Use a nightly closing routine"
     assert "Review tomorrow before ending today" in titles
+
+
+def test_editor_generation_job_updates_current_draft_atomically(content_http, monkeypatch):
+    db, client, csrf = content_http
+    selected = [knowledge(1, "Prepare one thing for future-you", "routines & weekly resets"),
+                knowledge(1, "Review tomorrow before ending today", "routines & weekly resets")]
+    grocery = knowledge(1, "Inventory before shopping", "grocery & food savings")
+    pending = knowledge(1, "Unverified routine", "routines & weekly resets", "PENDING")
+    db.add_all([*selected, grocery, pending])
+    db.commit()
+    draft = post(client, "/api/brands/1/content", draft_payload(slides=[
+        {"title": "7 things to do tonight to make tomorrow easier", "body": "", "kind": "cover", "items": []}]), csrf).json()
+    request = {"topic": draft["topic"], "pillar": draft["pillar"], "format": draft["format"],
+               "parent_id": draft["id"], "knowledge_refs": [row.id for row in selected], "update_current": True}
+    assert client.post("/api/brands/1/generate", json=request).status_code == 403
+    queued = post(client, "/api/brands/1/generate", request, csrf)
+    assert queued.status_code == 200
+    job_id = queued.json()["id"]
+    assert client.get(f"/api/brands/1/jobs/{job_id}").status_code == 200
+    assert db.get(Content, draft["id"]).revision == 1
+    captured = {}
+
+    class FakeProvider:
+        def generate(self, instruction, context, schema):
+            captured.update(context)
+            return GeneratedContent.model_validate({
+                **draft_payload(), "hook": "Model hook that must not replace the saved hook",
+                "slides": [{"title": "Tonight's short reset", "body": "Prepare one thing for tomorrow.",
+                            "kind": "cover", "items": []}], "caption": "A small nightly reset helps tomorrow.",
+                "knowledge_refs": [row.id for row in selected]})
+
+    monkeypatch.setattr(content_service, "provider", lambda _: FakeProvider())
+    execute(db, db.get(Job, job_id))
+    db.commit()
+    saved = client.get(f"/api/brands/1/content/{draft['id']}").json()
+    assert saved["id"] == draft["id"] and saved["revision"] == 2 and saved["status"] == "REVIEW"
+    assert saved["hook"] == draft["hook"] and len(saved["slides"]) == 1
+    assert saved["knowledge_refs"] == [row.id for row in selected]
+    assert [row["id"] for row in saved["generation"]["knowledge"]] == [row.id for row in selected]
+    assert db.get(Job, job_id).status == "DONE" and db.get(Job, job_id).target_id == draft["id"]
+    assert db.scalar(select(func.count()).select_from(Content)) == 1
+    assert captured["request"]["topic"] == draft["topic"] and captured["request"]["pillar"] == draft["pillar"]
+    assert [row["id"] for row in captured["knowledge"]] == [row.id for row in selected]
+    assert grocery.id not in [row["id"] for row in captured["knowledge"]]
+    assert pending.id not in [row["id"] for row in captured["knowledge"]]
+
+
+def test_failed_or_stale_generation_preserves_draft(content_http, monkeypatch):
+    db, client, csrf = content_http
+    routine = knowledge(1, "Review tomorrow before ending today", "routines & weekly resets")
+    db.add(routine)
+    db.commit()
+    draft = post(client, "/api/brands/1/content", draft_payload(), csrf).json()
+    request = {"topic": draft["topic"], "pillar": draft["pillar"], "format": draft["format"],
+               "parent_id": draft["id"], "knowledge_refs": [routine.id], "update_current": True}
+    job_id = post(client, "/api/brands/1/generate", request, csrf).json()["id"]
+
+    class InvalidProvider:
+        def generate(self, *_):
+            raise ProviderError("Local model returned invalid structured output")
+
+    monkeypatch.setattr(content_service, "provider", lambda _: InvalidProvider())
+    with pytest.raises(ProviderError, match="invalid structured output"):
+        execute(db, db.get(Job, job_id))
+    db.rollback()
+    unchanged = db.get(Content, draft["id"])
+    assert unchanged.revision == 1 and unchanged.body == "" and unchanged.status == "DRAFT"
+    assert db.scalar(select(func.count()).select_from(Content)) == 1
+    unchanged.revision = 2
+    db.commit()
+    with pytest.raises(DomainError, match="Draft changed"):
+        execute(db, db.get(Job, job_id))
+    db.rollback()
