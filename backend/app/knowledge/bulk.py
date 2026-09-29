@@ -212,7 +212,20 @@ def _key(token):
     return "knowledge_import:" + hashlib.sha256(token.encode()).hexdigest()[:60]
 
 
-def preview(db, brand_id, content, file_format, actor, admin_id, session_hash):
+def _artifact_digest(artifact):
+    encoded = json.dumps(artifact, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stored_plan(result):
+    return {"total": result["total"], "valid": result["valid"], "invalid": result["invalid"],
+            "duplicates": result["duplicates"], "warnings": result["warnings"],
+            "fingerprint": result["fingerprint"],
+            "rows": [{key: row[key] for key in ("row", "status", "matching_id", "duplicate_of_row",
+                                                  "errors", "warnings", "_data")} for row in result["rows"]]}
+
+
+def preview(db, brand_id, content, file_format, actor, admin_id, session_hash, raw_bytes=None):
     require(db, Brand, brand_id)
     for old in db.scalars(select(SystemSetting).where(SystemSetting.key.like("knowledge_import:%"))):
         if old.value.get("expires_at", 0) < utcnow().timestamp() or (old.value.get("brand_id") == brand_id and old.value.get("session_hash") == session_hash):
@@ -227,10 +240,12 @@ def preview(db, brand_id, content, file_format, actor, admin_id, session_hash):
         return {"file_errors": [exc.message], "total": 0, "valid": 0, "invalid": 0,
                 "duplicates": 0, "warnings": 0, "rows": [], "preview_token": None}
     token = secrets.token_urlsafe(24)
-    digest = hashlib.sha256((file_format + "\0" + content).encode("utf-8")).hexdigest()
+    artifact = {"format": file_format,
+                "file_digest": hashlib.sha256(raw_bytes if raw_bytes is not None else content.encode("utf-8")).hexdigest(),
+                "plan": _stored_plan(result)}
     db.add(SystemSetting(key=_key(token), value={"brand_id": brand_id, "admin_id": admin_id,
-        "session_hash": session_hash, "content_digest": digest, "fingerprint": result["fingerprint"],
-        "expires_at": (utcnow() + timedelta(minutes=30)).timestamp()}))
+        "session_hash": session_hash, "artifact": artifact, "artifact_digest": _artifact_digest(artifact),
+        "created_at": utcnow().timestamp(), "expires_at": (utcnow() + timedelta(minutes=30)).timestamp()}))
     record(db, "knowledge.import_previewed", brand_id, brand_id, actor,
            details={"format": file_format, "total": result["total"], "valid": result["valid"],
                     "invalid": result["invalid"], "duplicates": result["duplicates"], "warnings": result["warnings"]})
@@ -238,26 +253,29 @@ def preview(db, brand_id, content, file_format, actor, admin_id, session_hash):
     return {**_public(result), "file_errors": [], "preview_token": token}
 
 
-def commit(db, brand_id, content, file_format, preview_token, duplicate_mode, skip_invalid,
-           actor, admin_id, session_hash):
+def commit(db, brand_id, preview_token, duplicate_mode, skip_invalid, actor, admin_id, session_hash):
     with _commit_lock:
-        return _commit(db, brand_id, content, file_format, preview_token, duplicate_mode,
-                       skip_invalid, actor, admin_id, session_hash)
+        return _commit(db, brand_id, preview_token, duplicate_mode, skip_invalid,
+                       actor, admin_id, session_hash)
 
 
-def _commit(db, brand_id, content, file_format, preview_token, duplicate_mode, skip_invalid,
-            actor, admin_id, session_hash):
+def _commit(db, brand_id, preview_token, duplicate_mode, skip_invalid, actor, admin_id, session_hash):
     if duplicate_mode not in {"SKIP_DUPLICATES", "UPDATE_MATCHING"}:
         raise DomainError("Choose Skip duplicates or Update matching")
     pending = db.get(SystemSetting, _key(preview_token)) if preview_token else None
     if not pending or pending.value.get("brand_id") != brand_id or pending.value.get("admin_id") != admin_id or pending.value.get("session_hash") != session_hash or pending.value.get("expires_at", 0) < utcnow().timestamp():
         raise DomainError("Import preview expired or belongs to another session/brand. Preview the file again.", 409)
-    digest = hashlib.sha256((file_format + "\0" + content).encode("utf-8")).hexdigest()
-    if digest != pending.value["content_digest"]:
-        raise DomainError("Import file changed after preview. Preview it again.", 409)
-    result = plan(db, brand_id, content, file_format)
-    if result["fingerprint"] != pending.value["fingerprint"]:
+    artifact = pending.value.get("artifact")
+    if not isinstance(artifact, dict) or _artifact_digest(artifact) != pending.value.get("artifact_digest"):
+        raise DomainError("Import preview artifact is invalid. Preview the file again.", 409)
+    plan_result = artifact.get("plan")
+    if not isinstance(plan_result, dict) or not artifact.get("file_digest"):
+        raise DomainError("Import preview artifact is invalid. Preview the file again.", 409)
+    brand = require(db, Brand, brand_id)
+    existing, _, fingerprint = _snapshot(db, brand)
+    if fingerprint != plan_result.get("fingerprint"):
         raise DomainError("Brand knowledge or pillars changed after preview. Preview the file again.", 409)
+    result = {**plan_result, "_existing": {item.id: item for item in existing}}
     if result["invalid"] and not skip_invalid:
         raise DomainError("Review invalid rows and explicitly choose to skip them before committing", 409)
     created = updated = skipped = rejected = 0
@@ -284,7 +302,7 @@ def _commit(db, brand_id, content, file_format, preview_token, duplicate_mode, s
             db.flush()
     db.delete(pending)
     record(db, "knowledge.import_committed", brand_id, brand_id, actor,
-           details={"format": file_format, "mode": duplicate_mode, "total": result["total"],
+            details={"format": artifact["format"], "mode": duplicate_mode, "total": result["total"],
                     "created": created, "updated": updated, "skipped": skipped, "rejected": rejected})
     db.commit()
     return {"total": result["total"], "created": created, "updated": updated,

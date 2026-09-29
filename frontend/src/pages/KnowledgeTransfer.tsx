@@ -10,7 +10,7 @@ type Preview = {total:number;valid:number;invalid:number;duplicates:number;warni
 type Result = {total:number;created:number;updated:number;skipped:number;rejected:number}
 
 export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:()=>void;committed:()=>Promise<unknown>}) {
- const [file,setFile]=useState<File|null>(null),[format,setFormat]=useState<Format>('csv'),[content,setContent]=useState('')
+ const [file,setFile]=useState<File|null>(null),[format,setFormat]=useState<Format>('csv')
  const [preview,setPreview]=useState<Preview|null>(null),[result,setResult]=useState<Result|null>(null)
  const [mode,setMode]=useState<Mode>('SKIP_DUPLICATES'),[skipInvalid,setSkipInvalid]=useState(false)
  const [filter,setFilter]=useState('All'),[page,setPage]=useState(0),[busy,setBusy]=useState(false),[error,setError]=useState('')
@@ -21,14 +21,11 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
   setBusy(true);setError('');setResult(null);setPreview(null)
   try{
    if(file.size>20_000_000)throw new Error('Import exceeds 20 MB; split it into smaller files')
-   let text:string
-   try{text=new TextDecoder('utf-8',{fatal:true}).decode(await file.arrayBuffer())}
-   catch{throw new Error('File must be UTF-8 encoded CSV or JSON')}
    const upload=new FormData()
    upload.append('format',format)
    upload.append('file',file)
    const result=await apiUpload<Preview>(brandPath(brandId,'/knowledge/import/preview'),upload)
-   setContent(text);setPreview(result);setPage(0);setFilter('All');setSkipInvalid(false)
+  setPreview(result);setPage(0);setFilter('All');setSkipInvalid(false)
   }catch(reason){setError((reason as Error).message)}finally{setBusy(false)}
  }
  async function commit(){
@@ -36,14 +33,14 @@ export function KnowledgeImport({brandId,close,committed}:{brandId:number;close:
   setBusy(true);setError('')
   try{
    const summary=await api<Result>(brandPath(brandId,'/knowledge/import/commit'),'POST',{
-    format,content,preview_token:preview.preview_token,duplicate_mode:mode,skip_invalid:skipInvalid})
+    preview_token:preview.preview_token,duplicate_mode:mode,skip_invalid:skipInvalid})
    setResult(summary);await committed()
   }catch(reason){setError((reason as Error).message)}finally{setBusy(false)}
  }
  return <div className="knowledge-transfer-scope"><Modal title="Import knowledge" close={close}><div className="import-workflow">
   {!result?<>
    <p className="muted">Upload → Validate → Preview → Resolve → Commit. Nothing is added to knowledge during preview.</p>
-   <Field label="CSV or JSON file"><input type="file" accept=".csv,.json,text/csv,application/json" onChange={event=>{const next=event.target.files?.[0]||null;setFile(next);setFormat(next?.name.toLowerCase().endsWith('.json')?'json':'csv');setPreview(null);setContent('');setError('')}}/></Field>
+  <Field label="CSV or JSON file"><input type="file" accept=".csv,.json,text/csv,application/json" onChange={event=>{const next=event.target.files?.[0]||null;setFile(next);setFormat(next?.name.toLowerCase().endsWith('.json')?'json':'csv');setPreview(null);setError('')}}/></Field>
    <p><a href={`/api${brandPath(brandId,'/knowledge/import/template.csv')}`} download>Download CSV template</a></p>
    {file&&<p className="muted">{file.name} · {(file.size/1024).toFixed(1)} KB · {format.toUpperCase()}</p>}
    <button type="button" className="primary" disabled={!file||busy} onClick={()=>void validate()}>{busy?'Validating…':'Validate and preview'}</button>

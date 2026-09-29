@@ -1,6 +1,6 @@
 import json
 from typing import Literal
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from app.db.session import get_db
@@ -17,6 +17,7 @@ from app.publishing.service import publish, reconcile
 from app.publishing.providers import ManualExportPublisher
 from app.audit.service import record
 from app.knowledge import bulk as knowledge_bulk
+from app.knowledge import review as knowledge_review
 from app.core.errors import DomainError
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
@@ -125,12 +126,62 @@ def knowledge(brand_id: int, q: str = "", db=Depends(get_db)):
     return [serialize(k) for k in knowledge_service.search(db, brand_id, q)]
 
 
-class KnowledgeImportInput(BaseModel):
-    format: Literal["csv", "json"]
-    content: str = Field(max_length=20_000_000)
+class ReviewFilters(BaseModel):
+    q: str = Field(default="", max_length=200)
+    verification: Literal["PENDING", "APPROVED", "REJECTED"] | None = None
+    enabled: bool | None = None
+    category: str = Field(default="", max_length=120)
+    source: str = Field(default="", max_length=2000)
+    source_contains: str = Field(default="", max_length=200)
+    tag: str = Field(default="", max_length=120)
+    safety: Literal["all", "sensitive", "standard"] = "all"
+    sort: Literal["newest", "oldest", "title", "category", "source"] = "newest"
 
 
-class KnowledgeCommitInput(KnowledgeImportInput):
+class ReviewSelectedId(BaseModel):
+    id: int
+    version: str = Field(min_length=64, max_length=64)
+
+
+class ReviewSelectionInput(BaseModel):
+    scope: Literal["ids", "matching"]
+    ids: list[ReviewSelectedId] = Field(default_factory=list, max_length=20_000)
+    filters: ReviewFilters = Field(default_factory=ReviewFilters)
+
+
+class ReviewActionInput(BaseModel):
+    selection_token: str = Field(min_length=20, max_length=100)
+    action: Literal["APPROVE", "PENDING", "REJECT", "ENABLE", "DISABLE"]
+    include_sensitive: bool = False
+
+
+@router.get("/knowledge/review")
+def knowledge_review_list(brand_id: int, q: str = "", verification: Literal["PENDING", "APPROVED", "REJECTED"] | None = None,
+                          enabled: bool | None = None, category: str = "", source: str = "",
+                          source_contains: str = "", tag: str = "", safety: Literal["all", "sensitive", "standard"] = "all",
+                          sort: Literal["newest", "oldest", "title", "category", "source"] = "newest",
+                          page: int = Query(default=1, ge=1), db=Depends(get_db)):
+    filters = ReviewFilters(q=q, verification=verification, enabled=enabled, category=category, source=source,
+                            source_contains=source_contains, tag=tag, safety=safety, sort=sort)
+    return knowledge_review.list_page(db, brand_id, filters.model_dump(), page)
+
+
+@router.post("/knowledge/review/selection")
+def knowledge_review_selection(brand_id: int, data: ReviewSelectionInput, request: Request,
+                               admin=Depends(authenticated), db=Depends(get_db)):
+    return knowledge_review.create_selection(db, brand_id, admin, request.state.session.token_hash,
+                                             data.scope, [item.model_dump() for item in data.ids],
+                                             data.filters.model_dump())
+
+
+@router.post("/knowledge/review/apply")
+def knowledge_review_apply(brand_id: int, data: ReviewActionInput, request: Request,
+                           admin=Depends(authenticated), db=Depends(get_db)):
+    return knowledge_review.apply(db, brand_id, admin, request.state.session.token_hash,
+                                  data.selection_token, data.action, data.include_sensitive)
+
+
+class KnowledgeCommitInput(BaseModel):
     preview_token: str = Field(min_length=20, max_length=100)
     duplicate_mode: Literal["SKIP_DUPLICATES", "UPDATE_MATCHING"]
     skip_invalid: bool = False
@@ -153,14 +204,14 @@ async def knowledge_import_preview(brand_id: int, request: Request, format: Lite
     except UnicodeDecodeError as exc:
         raise DomainError("File must be UTF-8 encoded CSV or JSON") from exc
     return knowledge_bulk.preview(db, brand_id, content, format, admin.username,
-                                  admin.id, request.state.session.token_hash)
+                                  admin.id, request.state.session.token_hash, raw)
 
 
 @router.post("/knowledge/import/commit")
 def knowledge_import_commit(brand_id: int, data: KnowledgeCommitInput, request: Request,
                             admin=Depends(authenticated), db=Depends(get_db)):
-    return knowledge_bulk.commit(db, brand_id, data.content, data.format, data.preview_token,
-                                 data.duplicate_mode, data.skip_invalid, admin.username,
+    return knowledge_bulk.commit(db, brand_id, data.preview_token, data.duplicate_mode,
+                                 data.skip_invalid, admin.username,
                                  admin.id, request.state.session.token_hash)
 
 

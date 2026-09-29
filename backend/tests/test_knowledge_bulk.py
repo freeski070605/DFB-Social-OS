@@ -13,7 +13,7 @@ from app.core.errors import DomainError
 from app.db.session import Base, utcnow
 from app.knowledge import bulk
 from app.knowledge.service import search
-from app.models import Admin, AdminSession, Audit, Brand, Knowledge
+from app.models import Admin, AdminSession, Audit, Brand, Knowledge, SystemSetting
 
 
 @pytest.fixture
@@ -46,8 +46,8 @@ def preview(db, brand_id, content, file_format):
     return bulk.preview(db, brand_id, content, file_format, "admin", 10, "session")
 
 
-def commit(db, brand_id, content, file_format, token, mode="SKIP_DUPLICATES", skip_invalid=False):
-    return bulk.commit(db, brand_id, content, file_format, token, mode, skip_invalid, "admin", 10, "session")
+def commit(db, brand_id, token, mode="SKIP_DUPLICATES", skip_invalid=False, admin_id=10, session_hash="session"):
+    return bulk.commit(db, brand_id, token, mode, skip_invalid, "admin", admin_id, session_hash)
 
 
 def test_csv_template_valid_import_and_retrieval_rules(db):
@@ -56,7 +56,7 @@ def test_csv_template_valid_import_and_retrieval_rules(db):
     result = preview(db, 1, content, "csv")
     assert (result["total"], result["valid"], result["invalid"], result["duplicates"]) == (1, 1, 0, 0)
     assert db.scalars(select(Knowledge)).all() == []  # Preview does not create knowledge.
-    summary = commit(db, 1, content, "csv", result["preview_token"])
+    summary = commit(db, 1, result["preview_token"])
     assert summary == {"total": 1, "created": 1, "updated": 0, "skipped": 0, "rejected": 0}
     item = db.scalar(select(Knowledge))
     assert item.source == "  Journal of Examples, 2025  "
@@ -78,7 +78,7 @@ def test_json_import_pending_fallback_and_explicit_approval(db):
     assert result["valid"] == 2
     assert result["rows"][0]["record"]["verification"] == "PENDING"
     assert result["warnings"] >= 1
-    commit(db, 1, content, "json", result["preview_token"])
+    commit(db, 1, result["preview_token"])
     assert {row.title for row in search(db, 1, approved=True)} == {"Approved"}
     assert db.scalar(select(Knowledge).where(Knowledge.title == "Unverified")).tags == ["one", "two"]
 
@@ -91,11 +91,11 @@ def test_malformed_rows_require_explicit_rejection(db):
     assert len(result["rows"][0]["errors"]) >= 4
     assert result["rows"][1]["record"]["verification"] == "PENDING"
     with pytest.raises(DomainError, match="explicitly choose"):
-        commit(db, 1, content, "csv", result["preview_token"])
-    summary = commit(db, 1, content, "csv", result["preview_token"], skip_invalid=True)
+        commit(db, 1, result["preview_token"])
+    summary = commit(db, 1, result["preview_token"], skip_invalid=True)
     assert (summary["created"], summary["rejected"]) == (1, 1)
     with pytest.raises(DomainError, match="expired"):
-        commit(db, 1, content, "csv", result["preview_token"], skip_invalid=True)
+        commit(db, 1, result["preview_token"], skip_invalid=True)
     malformed = preview(db, 1, "not,json\n", "csv")
     assert malformed["file_errors"] and malformed["preview_token"] is None
 
@@ -111,10 +111,10 @@ def test_duplicate_detection_skip_update_and_upload_repeats(db):
     assert first["duplicates"] == 2
     assert first["rows"][0]["matching_id"] == original.id
     assert first["rows"][1]["duplicate_of_row"] == 2
-    skipped = commit(db, 1, content, "csv", first["preview_token"])
+    skipped = commit(db, 1, first["preview_token"])
     assert skipped["skipped"] == 2 and original.source == "old"
     second = preview(db, 1, content, "csv")
-    updated = commit(db, 1, content, "csv", second["preview_token"], mode="UPDATE_MATCHING")
+    updated = commit(db, 1, second["preview_token"], mode="UPDATE_MATCHING")
     db.refresh(original)
     assert updated["updated"] == 1 and updated["skipped"] == 1
     assert original.body == "Revised body" and original.source == "new"
@@ -129,13 +129,39 @@ def test_brand_isolation_and_stale_preview(db):
     result = preview(db, 1, content, "csv")
     assert result["duplicates"] == 0
     with pytest.raises(DomainError, match="another session/brand"):
-        commit(db, 2, content, "csv", result["preview_token"])
+        commit(db, 2, result["preview_token"])
     db.add(Knowledge(brand_id=1, title="Newly added", category="Health", body="Changes snapshot.",
                      source="", restrictions="", tags=[], verification="PENDING", enabled=False))
     db.commit()
     with pytest.raises(DomainError, match="changed after preview"):
-        commit(db, 1, content, "csv", result["preview_token"])
+        commit(db, 1, result["preview_token"])
     assert db.scalar(select(Knowledge).where(Knowledge.brand_id == 2)).body == "Other brand body."
+
+
+def test_preview_artifact_rejects_wrong_session_tampering_and_expiry(db):
+    content = csv_content(entry(title="Protected preview"))
+    result = preview(db, 1, content, "csv")
+    token = result["preview_token"]
+    with pytest.raises(DomainError, match="another session/brand"):
+        commit(db, 1, token, session_hash="other-session")
+    with pytest.raises(DomainError, match="another session/brand"):
+        commit(db, 2, token)
+    with pytest.raises(DomainError, match="another session/brand"):
+        commit(db, 1, "x" * len(token))
+
+    setting = db.get(SystemSetting, bulk._key(token))
+    artifact = {**setting.value["artifact"], "plan": {**setting.value["artifact"]["plan"], "rows": []}}
+    setting.value = {**setting.value, "artifact": artifact}
+    db.commit()
+    with pytest.raises(DomainError, match="artifact is invalid"):
+        commit(db, 1, token)
+
+    expired = preview(db, 1, content, "csv")["preview_token"]
+    setting = db.get(SystemSetting, bulk._key(expired))
+    setting.value = {**setting.value, "expires_at": (utcnow() - timedelta(minutes=1)).timestamp()}
+    db.commit()
+    with pytest.raises(DomainError, match="expired"):
+        commit(db, 1, expired)
 
 
 @pytest.mark.parametrize("file_format", ["csv", "json"])
@@ -149,7 +175,7 @@ def test_export_reimport_round_trip(db, file_format):
     content = bulk.export_csv(original) if file_format == "csv" else json.dumps(original)
     result = preview(db, 2, content, file_format)
     assert result["valid"] == 1 and result["invalid"] == 0
-    commit(db, 2, content, file_format, result["preview_token"])
+    commit(db, 2, result["preview_token"])
     assert bulk.export_rows(db, 2) == original
     assert search(db, 2, approved=True) == []
 
@@ -167,7 +193,7 @@ def test_large_import_uses_one_commit_and_batches(db, monkeypatch):
         return original_commit()
 
     monkeypatch.setattr(db, "commit", counted_commit)
-    summary = commit(db, 1, content, "csv", result["preview_token"])
+    summary = commit(db, 1, result["preview_token"])
     assert summary["created"] == 3000 and calls == 1
     assert db.scalar(select(Knowledge).where(Knowledge.brand_id == 1).limit(1)) is not None
 
@@ -196,15 +222,19 @@ def test_import_and_export_http_routes(db):
     db.add(admin)
     db.flush()
     session_token, csrf = "test-session-token", "test-csrf-token"
+    other_session_token, other_csrf = "other-test-session-token", "other-test-csrf-token"
     db.add(AdminSession(token_hash=hashlib.sha256(session_token.encode()).hexdigest(), admin_id=admin.id,
                         csrf=csrf, expires_at=utcnow() + timedelta(hours=1)))
+    db.add(AdminSession(token_hash=hashlib.sha256(other_session_token.encode()).hexdigest(), admin_id=admin.id,
+                        csrf=other_csrf, expires_at=utcnow() + timedelta(hours=1)))
     db.commit()
     app.dependency_overrides[get_db] = test_db
     try:
         client = TestClient(app)
         template = client.get("/api/brands/1/knowledge/import/template.csv")
         assert template.status_code == 401
-        content = csv_content(entry(title="HTTP route"))
+        content = "\ufeff" + csv_content(entry(title="HTTP route"))
+        assert "\r\n" in content and "\n" not in content.replace("\r\n", "")
         path = "/api/brands/1/knowledge/import/preview"
         upload = {"file": ("Life_Help_Knowledge_Pack_v1.csv", content.encode(), "text/csv")}
         assert client.post(path, data={"format": "csv"}, files=upload).status_code == 401
@@ -219,9 +249,26 @@ def test_import_and_export_http_routes(db):
         assert response.json()["rows"][0]["record"]["title"] == "HTTP route"
         assert db.scalars(select(Knowledge)).all() == []
         token = response.json()["preview_token"]
-        committed = client.post("/api/brands/1/knowledge/import/commit", json={"format": "csv", "content": content,
-            "preview_token": token, "duplicate_mode": "SKIP_DUPLICATES"}, headers={"X-CSRF-Token": csrf})
+        commit_payload = {"preview_token": token, "duplicate_mode": "SKIP_DUPLICATES"}
+        wrong_brand = client.post("/api/brands/2/knowledge/import/commit", json=commit_payload,
+                                  headers={"X-CSRF-Token": csrf})
+        assert wrong_brand.status_code == 409
+        client.cookies.set("dfb_session", other_session_token)
+        wrong_session = client.post("/api/brands/1/knowledge/import/commit", json=commit_payload,
+                                    headers={"X-CSRF-Token": other_csrf})
+        assert wrong_session.status_code == 409
+        client.cookies.set("dfb_session", session_token)
+        tampered = client.post("/api/brands/1/knowledge/import/commit",
+                               json={**commit_payload, "preview_token": token[:-1] + "x"},
+                               headers={"X-CSRF-Token": csrf})
+        assert tampered.status_code == 409
+        committed = client.post("/api/brands/1/knowledge/import/commit", json=commit_payload,
+                                headers={"X-CSRF-Token": csrf})
         assert committed.status_code == 200 and committed.json()["created"] == 1
+        replay = client.post("/api/brands/1/knowledge/import/commit", json=commit_payload,
+                             headers={"X-CSRF-Token": csrf})
+        assert replay.status_code == 409
+        assert len(db.scalars(select(Knowledge).where(Knowledge.brand_id == 1)).all()) == 1
         exported = client.get("/api/brands/1/knowledge/export.json")
         assert exported.status_code == 200 and exported.json()[0]["title"] == "HTTP route"
         assert client.get("/api/brands/2/knowledge/export.json").json() == []
