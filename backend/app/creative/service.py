@@ -4,6 +4,7 @@ from app.models import Brand, Content, Template
 from app.schemas.domain import Slide, BrandConfig, Visual
 from app.repositories.common import require
 from app.creative.renderer import render_slide
+from app.content.editorial import headline_count
 from app.storage.local import LocalStorage
 from app.audit.service import record
 from app.core.errors import DomainError
@@ -28,7 +29,9 @@ def render_content(db, brand_id, content_id, actor="admin"):
             token_values.update({key: value for key, value in templates[slide.kind].config.items()
                                  if key in {"background", "foreground", "accent", "muted"}})
         v = Visual.model_validate(token_values)
-        images.append(render_slide(slide, v, i + 1, len(item.slides)))
+        numbered = bool(headline_count(item.topic) and len(item.slides) == headline_count(item.topic) + 1
+                        and item.slides[0].get("kind") == "cover")
+        images.append(render_slide(slide, v, i + 1, len(item.slides), numbered=numbered))
     storage, assets = LocalStorage(), []
     for i, data in enumerate(images):
         digest = hashlib.sha256(data).hexdigest()[:24]

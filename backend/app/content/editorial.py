@@ -18,6 +18,8 @@ BENEFIT_STARTS = ("save time", "reduce stress", "reduce last-minute", "boost", "
                   "prevent last-minute", "avoid last-minute", "be prepared", "feel more",
                   "stay connected", "peace of mind", "prioritize your day")
 CLAIMS = ("sleep quality", "productivity", "stress", "self-awareness", "mental load")
+FORMAL_COPY = ("what you will", "ensure that", "in order to", "it is important to",
+               "make certain", "utilize", "facilitate", "commence", "leverage")
 
 
 def headline_count(topic):
@@ -152,6 +154,8 @@ def evaluate(topic, slides, caption, knowledge_refs, config, plan=None, evidence
         if any(phrase in body.casefold() for phrase in GENERIC) or any(
                 phrase in body.casefold() for phrase in BENEFIT_STARTS):
             deduct("specificity", 3, f"Slide {index} uses generic benefit language instead of useful detail")
+        if any(phrase in (title + " " + body).casefold() for phrase in FORMAL_COPY):
+            deduct("specificity", 3, f"Slide {index} sounds unnecessarily formal; use everyday wording")
         if evidence is not None and (claim := unsupported_claim(body, evidence)):
             deduct("grounding", 5, f"Slide {index} makes an unsupported {claim} claim", True)
         if not re.match(r"^(put|set|write|pack|lay|check|review|choose|clear|prep|prepare|charge|move|make|fill|pick|leave|place|list|reset|decide|schedule|open|close|take|gather|sort|create|use|do|keep|finish)\b", title.casefold()):

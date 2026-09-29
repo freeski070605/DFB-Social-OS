@@ -290,7 +290,8 @@ def generate(db, brand_id, request, actor="admin", target_id=None, expected_revi
         raise DomainError("Generated content still needs editorial work after one revision: " +
                           "; ".join(assessment["blocking_issues"][:3]))
     for index, slide in enumerate(output.slides, start=1):
-        render_slide(Slide.model_validate(slide.model_dump()), config.visual, index, len(output.slides))
+        render_slide(Slide.model_validate(slide.model_dump()), config.visual, index, len(output.slides),
+                     numbered=bool(editorial.headline_count(request.topic)))
     item = save(db, brand_id, ContentInput.model_validate(output.model_dump()), key=target_id, actor=actor)
     item.generation = {"provider": config.ai.provider, "model": config.ai.model, "knowledge": [
         {"id": k.id, "title": k.title, "source": k.source, "updated_at": k.updated_at.isoformat(),

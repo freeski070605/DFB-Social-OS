@@ -62,8 +62,8 @@ def _footer(draw, visual, index, total, inverse=False):
     faint = visual.background if inverse else visual.muted
     if visual.border_treatment == "line":
         draw.line((MARGIN, 1215, WIDTH - MARGIN, 1215), fill=faint, width=2)
-    if visual.footer_treatment == "mark":
-        fit_text(draw, visual.mark or "PRACTICAL NOTES", (MARGIN, 1242, 700, 52), 24, 20, faint)
+    if visual.footer_treatment == "mark" and visual.mark:
+        fit_text(draw, visual.mark, (MARGIN, 1242, 700, 52), 30, 26, faint)
     draw.text((WIDTH - MARGIN, 1245), f"{index:02d} / {total:02d}", font=font(25), fill=ink, anchor="rt")
 
 
@@ -78,7 +78,7 @@ def _items(draw, values, y, visual):
         fit_text(draw, value, (MARGIN + 76, cy, 825, row_height - 10), 44, 36, visual.foreground)
 
 
-def render_slide(slide: Slide, visual: Visual, index=1, total=1):
+def render_slide(slide: Slide, visual: Visual, index=1, total=1, numbered=False):
     validate_budget(slide)
     inverse = slide.kind == "end"
     background = visual.foreground if inverse else visual.background
@@ -88,10 +88,19 @@ def render_slide(slide: Slide, visual: Visual, index=1, total=1):
     radius = visual.corner_radius
     scale = visual.spacing_scale
     draw.rounded_rectangle((MARGIN, 68, WIDTH - MARGIN, 79), radius=5, fill=visual.accent)
+    if numbered and index > 1 and slide.kind != "numbered_action":
+        draw.rounded_rectangle((MARGIN, 123, MARGIN + 144, 194), radius=18, fill=visual.accent)
+        draw.text((MARGIN + 72, 158), f"{index - 1:02d}", font=font(49),
+                  fill=visual.foreground, anchor="mm")
     if slide.kind == "cover":
         draw.rounded_rectangle((MARGIN, 170, WIDTH - MARGIN, 1110), radius=radius + 12, fill=visual.foreground)
-        draw.rounded_rectangle((MARGIN + 38, 207, MARGIN + 265, 263), radius=20, fill=visual.accent)
-        fit_text(draw, "SAVEABLE GUIDE", (MARGIN + 59, 220, 190, 36), 22, 20, visual.foreground)
+        eyebrow = visual.compact_mark or visual.eyebrow
+        if eyebrow:
+            label_width = min(500, max(104, int(draw.textlength(eyebrow, font=font(32))) + 48))
+            draw.rounded_rectangle((MARGIN + 38, 205, MARGIN + 38 + label_width, 276),
+                                   radius=20, fill=visual.accent)
+            fit_text(draw, eyebrow, (MARGIN + 62, 222, label_width - 48, 44),
+                     32, 27, visual.foreground)
         used = fit_text(draw, slide.title, (MARGIN + 45, 332, 822, 455), 91, 58, visual.background)
         fit_text(draw, slide.body, (MARGIN + 48, max(815, 332 + used + 35), 804, 230), 44, 36, visual.background)
         _footer(draw, visual, index, total)
@@ -100,7 +109,7 @@ def render_slide(slide: Slide, visual: Visual, index=1, total=1):
         draw.text((MARGIN + 92, 256), f"{index - 1:02d}", font=font(104), fill=visual.foreground, anchor="mm")
         used = fit_text(draw, slide.title, (MARGIN, 395, 910, 275), 78, 54, visual.foreground)
         y = max(700, 395 + used + int(36 * scale))
-        body_used = fit_text(draw, slide.body, (MARGIN, y, 900, 275), 50, 40, visual.foreground)
+        body_used = fit_text(draw, slide.body, (MARGIN, y, 900, 275), 56, 43, visual.foreground)
         if slide.items:
             panel_y = max(930, y + body_used + 35)
             if panel_y + 58 * len(slide.items) > 1170:
@@ -115,7 +124,7 @@ def render_slide(slide: Slide, visual: Visual, index=1, total=1):
         if not values:
             raise DomainError("Checklist and step slides require short list items")
         if slide.items and slide.body.strip():
-            fit_text(draw, slide.body, (MARGIN, 456, 900, 176), 48, 39, ink)
+            fit_text(draw, slide.body, (MARGIN, 456, 900, 176), 52, 42, ink)
             _items(draw, values, 690, visual)
         else:
             _items(draw, values, 545, visual)
@@ -123,7 +132,7 @@ def render_slide(slide: Slide, visual: Visual, index=1, total=1):
     elif slide.kind in {"statement", "tip", "end"}:
         draw.rounded_rectangle((MARGIN, 225, MARGIN + 22, 1080), radius=10, fill=visual.accent)
         used = fit_text(draw, slide.title, (MARGIN + 65, 300, 835, 380), 82, 54, ink)
-        fit_text(draw, slide.body, (MARGIN + 65, max(730, 300 + used + 50), 830, 325), 50, 40, ink)
+        fit_text(draw, slide.body, (MARGIN + 65, max(730, 300 + used + 50), 830, 325), 54, 43, ink)
         if slide.items:
             raise DomainError("Statement slides should have one focused thought; move list items to a checklist")
         _footer(draw, visual, index, total, inverse=inverse)

@@ -65,6 +65,16 @@ def test_automated_editorial_score_does_not_claim_perfection():
     assert result["score"] <= 95
 
 
+def test_evaluator_flags_unnecessarily_formal_action_copy():
+    slides = [{"kind": "cover", "title": "A simple checklist", "body": "", "items": []},
+              {"kind": "numbered_action", "title": "Charge what you will carry",
+               "body": "Plug in your phone before bed so it is ready in the morning.", "items": []}]
+    result = editorial.evaluate("A simple checklist", slides,
+                                "Plug in the device you need in the morning, then leave it where you can find it. Save this for your next evening reset.",
+                                [1], BrandConfig())
+    assert any("unnecessarily formal" in issue for issue in result["issues"])
+
+
 @pytest.mark.parametrize("kind,title,body,items", [
     ("cover", "2 things to do tonight", "A small reset for tomorrow", []),
     ("numbered_action", "Pack tomorrow's bag", "Put the things you need by the door before bed.", []),

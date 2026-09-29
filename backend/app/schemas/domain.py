@@ -17,7 +17,9 @@ class Visual(StrictModel):
     foreground: str = "#183C36"
     accent: str = "#D9F075"
     muted: str = "#65726A"
-    mark: str = "PRACTICAL NOTES"
+    mark: str = ""
+    compact_mark: str = ""
+    eyebrow: str = ""
     headline_font: Literal["Manrope"] = "Manrope"
     body_font: Literal["Manrope"] = "Manrope"
     corner_radius: int = Field(default=28, ge=0, le=80)
@@ -98,6 +100,8 @@ class InteractionRules(StrictModel):
 
 class BrandConfig(StrictModel):
     mission: str = ""
+    tagline: str = ""
+    short_bio: str = ""
     voice: str = "Clear, practical, warm and accurate"
     tone: str = "Helpful without judgment"
     audience: str = ""
