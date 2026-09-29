@@ -69,7 +69,7 @@ def test_incomplete_draft_saves_reopens_and_cannot_advance(content_http):
     assert response.status_code == 200, response.text
     saved = response.json()
     assert saved["status"] == "DRAFT" and saved["slides"] == []
-    assert saved["quality"]["status"] == "BLOCKED"
+    assert saved["quality"]["status"] == "NOT_SCORED" and saved["quality"]["score"] is None
     reopened = client.get(f"{path}/{saved['id']}")
     assert reopened.status_code == 200
     assert all(reopened.json()[key] == draft_payload()[key] for key in
@@ -89,6 +89,18 @@ def test_original_blank_cover_request_is_valid_only_as_draft(content_http):
     transition = post(client, f"/api/brands/1/content/{response.json()['id']}/transition",
                       {"state": "REVIEW"}, csrf)
     assert transition.status_code == 400
+
+
+def test_cover_title_only_is_not_a_quality_score_or_reviewable(content_http):
+    _, client, csrf = content_http
+    cover = [{"title": "7 things to do tonight", "body": "", "kind": "cover", "items": []}]
+    response = post(client, "/api/brands/1/content", draft_payload(slides=cover), csrf)
+    assert response.status_code == 200
+    saved = response.json()
+    assert saved["quality"]["score"] is None and saved["quality"]["status"] == "NOT_SCORED"
+    assert any("slide explanation/items" in error for error in saved["quality"]["errors"])
+    assert post(client, f"/api/brands/1/content/{saved['id']}/transition",
+                {"state": "REVIEW"}, csrf).status_code == 400
 
 
 def test_partial_slide_is_draft_only_and_render_requires_title(content_http):
@@ -138,13 +150,27 @@ def test_candidates_change_with_pillar_and_generation_revalidates(content_http, 
     routine_rows = client.get(path, params={"topic": "tomorrow easier", "pillar": "routines & weekly resets"}).json()
     assert [row["id"] for row in grocery_rows] == [grocery.id]
     assert [row["id"] for row in routine_rows] == [routine.id]
+    assert all(row["brand_id"] == 1 and row["category"] == "routines & weekly resets" and
+               row["verification"] == "APPROVED" and row["enabled"] for row in routine_rows)
     generate_path = "/api/brands/1/generate"
+    ungrounded = post(client, generate_path, {"topic": "tomorrow easier", "pillar": "routines & weekly resets",
+                                             "format": "carousel", "knowledge_refs": []}, csrf)
+    assert ungrounded.status_code == 400 and "Select and attach" in ungrounded.json()["detail"]
+    assert db.scalar(select(func.count()).select_from(Job)) == 0
     invalid = post(client, generate_path, {"topic": "tomorrow easier", "pillar": "routines & weekly resets",
                                             "format": "carousel", "knowledge_refs": [grocery.id]}, csrf)
     assert invalid.status_code == 400
     foreign = post(client, generate_path, {"topic": "tomorrow easier", "pillar": "routines & weekly resets",
                                             "format": "carousel", "knowledge_refs": [other.id]}, csrf)
     assert foreign.status_code == 400
+    unapproved = post(client, generate_path, {"topic": "tomorrow easier", "pillar": "routines & weekly resets",
+                                              "format": "carousel", "knowledge_refs": [pending.id]}, csrf)
+    assert unapproved.status_code == 400
+    stale_attachment = post(client, "/api/brands/1/content", draft_payload(knowledge_refs=[grocery.id]), csrf)
+    assert stale_attachment.status_code == 400
+    attached = post(client, "/api/brands/1/content", draft_payload(knowledge_refs=[routine.id]), csrf)
+    assert attached.status_code == 200 and attached.json()["knowledge_refs"] == [routine.id]
+    assert not any("No approved knowledge attached" in warning for warning in attached.json()["quality"]["warnings"])
     queued = post(client, generate_path, {"topic": "tomorrow easier", "pillar": "routines & weekly resets",
                                            "format": "carousel", "knowledge_refs": [routine.id]}, csrf)
     assert queued.status_code == 200 and queued.json()["payload"]["knowledge_refs"] == [routine.id]
@@ -157,6 +183,7 @@ def test_candidates_change_with_pillar_and_generation_revalidates(content_http, 
     class FakeProvider:
         def generate(self, instruction, context, schema):
             captured["ids"] = [row["id"] for row in context["knowledge"]]
+            captured["request"] = context["request"]
             raise CapturedInference
 
     monkeypatch.setattr(content_service, "provider", lambda _: FakeProvider())
@@ -164,9 +191,28 @@ def test_candidates_change_with_pillar_and_generation_revalidates(content_http, 
         content_service.generate(db, 1, GenerationInput(topic="tomorrow easier", pillar="routines & weekly resets",
                                                        knowledge_refs=[routine.id]))
     assert captured["ids"] == [routine.id]
+    assert captured["request"]["topic"] == "tomorrow easier"
+    assert captured["request"]["pillar"] == "routines & weekly resets"
     routine.enabled = False
     db.commit()
     with pytest.raises(Exception, match="approved, enabled"):
         content_service.generate(db, 1, GenerationInput(topic="tomorrow easier", pillar="routines & weekly resets",
                                                        knowledge_refs=[routine.id]))
     assert captured["ids"] == [routine.id]  # No second inference call.
+
+
+def test_current_topic_ranks_approved_routine_records_first(content_http):
+    db, client, _ = content_http
+    db.add_all([knowledge(1, "Inventory before shopping", "grocery & food savings"),
+                knowledge(1, "Use a nightly closing routine", "routines & weekly resets"),
+                knowledge(1, "Prepare for Monday the night before", "routines & weekly resets"),
+                knowledge(1, "Review tomorrow before ending today", "routines & weekly resets"),
+                knowledge(1, "Prepare one thing for future-you", "routines & weekly resets")])
+    db.commit()
+    response = client.get("/api/brands/1/knowledge/candidates", params={
+        "topic": "7 things to do tonight to make tomorrow easier", "pillar": "routines & weekly resets"})
+    assert response.status_code == 200
+    titles = [row["title"] for row in response.json()]
+    assert "Inventory before shopping" not in titles
+    assert titles[0] == "Use a nightly closing routine"
+    assert "Review tomorrow before ending today" in titles

@@ -59,6 +59,8 @@ def content_transition(brand_id: int, key: int, data: TransitionInput, admin=Dep
 @router.post("/generate")
 def generate(brand_id: int, data: GenerationInput, admin=Depends(authenticated), db=Depends(get_db)):
     data.pillar = content_service.canonical_pillar(db, brand_id, data.pillar)
+    if not data.knowledge_refs:
+        raise DomainError("Select and attach approved knowledge before generating")
     if not content_service.generation_candidates(db, brand_id, data.topic, data.pillar, data.knowledge_refs):
         raise DomainError("Approve and enable knowledge for this pillar before AI generation")
     job = enqueue(db, brand_id, "generate", payload=data.model_dump())
@@ -134,7 +136,7 @@ def knowledge_candidates(brand_id: int, topic: str = Query(default="", max_lengt
                          pillar: str = Query(default="", max_length=120), db=Depends(get_db)):
     if not topic.strip() or not pillar.strip():
         return []
-    return [serialize(item) for item in content_service.generation_candidates(db, brand_id, topic, pillar)]
+    return [serialize(item) for item in content_service.generation_candidates(db, brand_id, topic, pillar, limit=12)]
 
 
 class ReviewFilters(BaseModel):

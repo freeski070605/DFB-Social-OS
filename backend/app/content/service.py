@@ -39,9 +39,18 @@ def generation_candidates(db, brand_id, topic, pillar, selected_ids=None, limit=
         if len(set(selected_ids)) != len(selected_ids) or any(key not in by_id for key in selected_ids):
             raise DomainError("Selected knowledge must be approved, enabled, and in this brand and pillar")
         return [by_id[key] for key in selected_ids]
-    words = re.findall(r"\w{3,}", topic.casefold())[:12]
-    rows.sort(key=lambda item: (-sum(word in item.title.casefold() for word in words) * 3 -
-                                sum(word in item.body.casefold() for word in words), item.id))
+    words = set(re.findall(r"\w{3,}", topic.casefold())) - {
+        "the", "and", "for", "you", "your", "things", "thing", "make", "with", "that", "this", "how", "what"}
+    related = {"tonight": {"evening", "night", "nightly", "bedtime"},
+               "tomorrow": {"morning", "next day"}}
+    terms = words | set().union(*(related.get(word, set()) for word in words))
+
+    def relevance(item):
+        title, body = item.title.casefold(), item.body.casefold()
+        return sum(3 * bool(re.search(r"\b" + re.escape(term) + r"\b", title)) +
+                   bool(re.search(r"\b" + re.escape(term) + r"\b", body)) for term in terms)
+
+    rows.sort(key=lambda item: (-relevance(item), item.id))
     return rows[:limit]
 
 
@@ -49,7 +58,7 @@ def transition(db, item, state, actor="admin", reason=""):
     if state not in TRANSITIONS.get(item.status, set()):
         raise DomainError(f"Invalid transition: {item.status} → {state}", 409)
     if state in {"REVIEW", "APPROVED"}:
-        quality = quality_check(db, item)
+        quality = quality_check(db, item, for_review=True)
         if quality["errors"]:
             raise DomainError("; ".join(quality["errors"]))
         item.quality = quality
@@ -63,17 +72,19 @@ def transition(db, item, state, actor="admin", reason=""):
     return item
 
 
-def quality_check(db, item):
+def quality_check(db, item, for_review=False):
     errors, warnings = [], []
-    if not item.hook or not (item.body or item.slides or item.caption):
-        errors.append("Content requires a hook and body, slides or caption")
+    substantive_slides = any(slide.get("body", "").strip() or any(value.strip() for value in slide.get("items", []))
+                             for slide in item.slides or [])
+    if not item.hook or not (item.body.strip() or substantive_slides or item.caption.strip()):
+        errors.append("Content requires a hook and body, slide explanation/items or caption")
     config = BrandConfig.model_validate(require(db, Brand, item.brand_id).config)
     text = " ".join([item.topic, item.hook, item.body, item.caption]).lower()
     for term in config.prohibited_topics:
         if term.lower() in text:
             warnings.append(f"Review prohibited topic: {term}")
     if not item.knowledge_refs:
-        warnings.append("No approved knowledge attached; administrator must verify factual claims")
+        warnings.append("No approved knowledge attached to this draft; select eligible records or verify factual claims")
     if item.format in {"carousel", "checklist", "steps", "do_dont", "comparison", "single_graphic", "tip", "story"} and not item.slides:
         errors.append("This graphic format needs at least one slide")
     for number, slide in enumerate(item.slides or [], start=1):
@@ -87,7 +98,9 @@ def quality_check(db, item):
             errors.append(f"Slide {number} needs at least two columns")
     if "instagram" in item.targets and not item.assets:
         errors.append("Render graphics before approving Instagram content")
-    return {"score": max(0, 100 - 35 * len(errors) - 10 * len(warnings)), "status": "BLOCKED" if errors else "REVIEWED", "errors": errors, "warnings": warnings}
+    return {"score": max(0, 100 - 35 * len(errors) - 10 * len(warnings)) if for_review else None,
+            "status": ("BLOCKED" if errors else "REVIEWED") if for_review else "NOT_SCORED",
+            "errors": errors, "warnings": warnings}
 
 
 def save(db, brand_id, data: ContentInput, key=None, actor="admin"):
@@ -100,8 +113,8 @@ def save(db, brand_id, data: ContentInput, key=None, actor="admin"):
     refs = []
     for ref_id in data.knowledge_refs:
         ref = require(db, Knowledge, ref_id, brand_id)
-        if not ref.enabled or ref.verification != "APPROVED":
-            raise DomainError("Only enabled, approved knowledge can be attached")
+        if not ref.enabled or ref.verification != "APPROVED" or normalized(ref.category) != normalized(data.pillar):
+            raise DomainError("Only enabled, approved knowledge from the current pillar can be attached")
         refs.append(ref)
     before = {"revision": item.revision, "status": item.status} if key else {}
     for field, value in data.model_dump().items():
