@@ -100,6 +100,9 @@ class InteractionRules(StrictModel):
 
 class BrandConfig(StrictModel):
     mission: str = ""
+    brand_promise: str = ""
+    writing_rule: str = ""
+    visual_direction: str = ""
     tagline: str = ""
     short_bio: str = ""
     voice: str = "Clear, practical, warm and accurate"

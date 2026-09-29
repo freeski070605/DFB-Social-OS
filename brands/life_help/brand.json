@@ -4,6 +4,9 @@
   "description": "Practical knowledge for everyday life — the useful things people are often expected to know without anyone clearly teaching them.",
   "config": {
     "mission": "Help people understand and handle the practical parts of everyday life. Make it useful enough to save, share, or remember because it makes real life easier.",
+    "brand_promise": "Practical information that makes everyday life easier.",
+    "writing_rule": "Explain useful things like a smart friend who figured something out and thought you should know too.",
+    "visual_direction": "Modern editorial, practical reference guide, strong typography, high contrast, lime annotation accents, useful whitespace, clean mobile readability. No crown or primary handwriting typography.",
     "tagline": "Stuff you're somehow supposed to know.",
     "short_bio": "Practical stuff for money, home, food, work & everyday life.\nStuff you're somehow supposed to know.",
     "voice": "Practical, conversational, intelligent without sounding academic, confident without pretending to know everything. Lightly witty only when natural. Specific, useful, calm and human.",

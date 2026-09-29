@@ -15,7 +15,7 @@ from app.db.session import SessionLocal, get_db
 from app.brands.service import seed
 from app.security.auth import authenticated
 from app.storage.local import LocalStorage
-from app.api import auth, brands, content, operations, system, webhooks, meta_auth
+from app.api import auth, brands, content, operations, system, webhooks, meta_auth, packages, youtube_auth
 
 
 @asynccontextmanager
@@ -92,7 +92,7 @@ async def unexpected_error(request, exc):
     return JSONResponse({"detail": "Unexpected server error. Inspect logs/dfb.jsonl."}, status_code=500)
 
 
-for router in (auth.router, brands.router, content.router, operations.router, system.router, webhooks.router, meta_auth.router):
+for router in (auth.router, brands.router, content.router, operations.router, system.router, webhooks.router, meta_auth.router, packages.router, youtube_auth.router):
     app.include_router(router)
 
 

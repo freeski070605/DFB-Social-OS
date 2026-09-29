@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text, JSON, Boolean, DateTime, ForeignKey
+from sqlalchemy import String, Text, JSON, Boolean, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.session import Base, utcnow
 
@@ -47,3 +47,15 @@ class PlatformAccount(Base):
     token_encrypted: Mapped[str] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class SocialIdentity(Base):
+    """Owner-entered public identity, separate from provider-verified authorization."""
+    __tablename__ = "social_identities"
+    __table_args__ = (UniqueConstraint("brand_id", "platform", name="uq_social_identity_brand_platform"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(30))
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    username: Mapped[str] = mapped_column(String(120), default="")
+    updated_at: Mapped[object] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

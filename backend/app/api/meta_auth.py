@@ -126,7 +126,6 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         existing.enabled = False
     after = None
     connected = 0
-    selected = set()
     for _ in range(10):
         params = {"fields": "id,name,access_token,tasks,instagram_business_account", "limit": 100}
         if after:
@@ -161,9 +160,9 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
                 if not account:
                     account = PlatformAccount(brand_id=brand_id, platform=platform, account_id=identity)
                     db.add(account)
-                account.token_encrypted, account.enabled = encrypt(page_token), platform not in selected
+                # Discovery never authorizes a publishing destination. The admin selects it explicitly.
+                account.token_encrypted, account.enabled = encrypt(page_token), False
                 account.config = {**common, "name": name or identity}
-                selected.add(platform)
                 connected += 1
         cursor = page.get("paging", {}).get("cursors", {}).get("after")
         if not page.get("data") or not cursor or cursor == after:

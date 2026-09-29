@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
-from app.models import Brand, PlatformAccount, Template
+from app.models import Brand, PlatformAccount, SocialIdentity, Template
 from app.security.auth import authenticated
 from app.security.secrets import encrypt
 from app.db.session import get_db
@@ -9,8 +9,12 @@ from app.repositories.common import require, serialize, list_brand
 from app.brands.service import save_brand
 from app.audit.service import record
 from app.api.meta_auth import account_view, inspect_account
+from app.api.youtube_auth import inspect_account as inspect_youtube
 from app.db.session import utcnow
 from app.core.errors import DomainError
+from app.accounts.capabilities import PROVIDERS, provider_view
+from pydantic import BaseModel, Field
+from typing import Literal
 
 router = APIRouter(prefix="/api/brands", tags=["brands"], dependencies=[Depends(authenticated)])
 
@@ -37,6 +41,43 @@ def update(brand_id: int, data: BrandInput, admin=Depends(authenticated), db=Dep
 @router.get("/{brand_id}/accounts")
 def accounts(brand_id: int, db=Depends(get_db)):
     return [account_view(a) for a in list_brand(db, PlatformAccount, brand_id)]
+
+
+@router.get("/{brand_id}/platforms")
+def platforms(brand_id: int, db=Depends(get_db)):
+    require(db, Brand, brand_id)
+    rows = list_brand(db, PlatformAccount, brand_id)
+    return [provider_view(platform, rows) for platform in PROVIDERS]
+
+
+class IdentityInput(BaseModel):
+    platform: Literal["facebook", "instagram", "youtube", "tiktok", "threads"]
+    display_name: str = Field(default="", max_length=120)
+    username: str = Field(default="", max_length=120)
+
+
+@router.get("/{brand_id}/social-identities")
+def identities(brand_id: int, db=Depends(get_db)):
+    require(db, Brand, brand_id)
+    return [serialize(row) for row in list_brand(db, SocialIdentity, brand_id)]
+
+
+@router.put("/{brand_id}/social-identities/{platform}")
+def identity_save(brand_id: int, platform: str, data: IdentityInput,
+                  admin=Depends(authenticated), db=Depends(get_db)):
+    require(db, Brand, brand_id)
+    if platform != data.platform:
+        raise DomainError("Platform mismatch")
+    row = db.scalar(select(SocialIdentity).where(SocialIdentity.brand_id == brand_id,
+                                                SocialIdentity.platform == platform))
+    if not row:
+        row = SocialIdentity(brand_id=brand_id, platform=platform)
+        db.add(row)
+    row.display_name, row.username = data.display_name, data.username
+    record(db, "identity.save", platform, brand_id, admin.username,
+           after={"display_name": data.display_name, "username": data.username})
+    db.commit()
+    return serialize(row)
 
 
 @router.post("/{brand_id}/accounts")
@@ -66,7 +107,11 @@ def account_save(brand_id: int, data: AccountInput, admin=Depends(authenticated)
 def account_check(brand_id: int, key: int, db=Depends(get_db)):
     account = require(db, PlatformAccount, key, brand_id)
     try:
-        result = inspect_account(account)
+        if account.platform == "youtube":
+            inspect_youtube(account)
+            result = account_view(account)
+        else:
+            result = inspect_account(account)
     except Exception:
         account.config = {**(account.config or {}), "token_status": "unhealthy", "last_checked": utcnow().isoformat() + "Z"}
         db.commit()
@@ -78,6 +123,8 @@ def account_check(brand_id: int, key: int, db=Depends(get_db)):
 @router.post("/{brand_id}/accounts/{key}/activate")
 def account_activate(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
     account = require(db, PlatformAccount, key, brand_id)
+    if (account.config or {}).get("token_status") != "healthy" or not account.token_encrypted:
+        raise DomainError("Verify this account through its provider before selecting it", 409)
     for other in db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
                                                           PlatformAccount.platform == account.platform)):
         other.enabled = other.id == key

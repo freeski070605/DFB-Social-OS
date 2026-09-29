@@ -28,7 +28,7 @@ Run future migrations with `Set-ExecutionPolicy -Scope Process Bypass; .\scripts
 ## First-Run Workflow
 
 1. Sign in with the administrator credentials you just created.
-2. Select **Brands** and choose **life_help**. Its seed configuration starts enabled; set its public name, description, audience, voice, schedule, and visual identity, then save. Keep its pause enabled until you have reviewed the configuration.
+2. Select **Brands** and choose **LIFE, APPARENTLY.** Its existing `life_help` slug is an internal identifier. Review its identity and keep its pause enabled.
 3. Add sourced entries under **Knowledge**. Mark only checked, reliable entries **APPROVED** and enabled. Approved knowledge is required for AI generation; manual writing does not require Ollama.
 4. Create content from **Content** or **Create**. Write manually or request local generation. Inspect every claim and source, then render graphics when needed. Instagram publishing requires rendered images.
 5. Send a draft to review, then approve it in the editor after checking the exact content. Schedule approved content on **Calendar**, or export a ZIP from the editor. The ZIP contains structured content, caption, and rendered slide images.

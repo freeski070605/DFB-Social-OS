@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     meta_app_secret: str = ""
     meta_redirect_uri: str = ""
     meta_verify_token: str = ""
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_redirect_uri: str = ""
     scheduler_enabled: bool = True
     session_hours: int = 12
 

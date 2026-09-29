@@ -56,7 +56,7 @@ def test_meta_oauth_state_is_one_use_and_accounts_are_brand_scoped(monkeypatch):
         assert result.status_code == 303
         accounts = db.scalars(select(PlatformAccount).order_by(PlatformAccount.id)).all()
         assert [(a.platform, a.account_id, a.enabled) for a in accounts] == [
-            ("facebook", "123", True), ("instagram", "456", True), ("facebook", "789", False)]
+            ("facebook", "123", False), ("instagram", "456", False), ("facebook", "789", False)]
         assert all(a.brand_id == 1 and a.token_encrypted.startswith("encrypted:") for a in accounts)
         assert not db.scalars(select(SystemSetting).where(SystemSetting.key.like("meta_oauth:%"))).first()
         with pytest.raises(DomainError, match="state validation failed"):

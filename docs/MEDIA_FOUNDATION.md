@@ -1,0 +1,9 @@
+# Content packages and connections
+
+Each content package belongs to one brand and keeps a single list of approved knowledge IDs. Each generated derivative stores only the IDs it actually used, its own platform format, structured output, evaluation, and model metadata. Existing content can be attached without changing its content ID or revision. Video derivatives remain in REVIEW; no video renderer or upload is present. The production JSON endpoint exports brand tokens, format, aspect ratio, narration, visual beats, output requirements, and provenance for a manual handoff or a future DFB AI Studio provider.
+
+Meta OAuth discovers Pages and linked Instagram professional accounts but leaves every newly discovered account unselected. In **Settings > Accounts**, inspect the discovered IDs and names, check the connection, then explicitly select the correct Page and Instagram account. A manually entered public handle is display metadata only and never indicates a live connection.
+
+YouTube OAuth currently requests only `youtube.readonly` for channel identity. Configure `DFB_YOUTUBE_CLIENT_ID`, `DFB_YOUTUBE_CLIENT_SECRET`, and `DFB_YOUTUBE_REDIRECT_URI` for a Google Web application. Register the exact redirect URI ending in `/api/youtube/callback`, then use **Connect YouTube** and select the discovered channel. Expired access tokens require reconnection in this foundation; the stored encrypted refresh token is reserved for a future upload integration. No YouTube upload or analytics scope is requested or used. TikTok and Threads have no live provider connection yet.
+
+Publishing remains subject to the existing global pause, brand pause, action permission, approval, validity, provider health, and idempotency checks. Package generation and JSON export perform no external social action.
