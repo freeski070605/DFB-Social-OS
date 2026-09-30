@@ -13,7 +13,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
 from app.audit.service import record
-from app.core.config import settings
+from app.core.config import settings, public_callback_url
 from app.core.errors import DomainError, ProviderError
 from app.db.session import get_db, utcnow
 from app.models import Brand, PlatformAccount, SystemSetting
@@ -22,6 +22,7 @@ from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 from app.accounts.credentials import encrypted_credential, has_credential
 from app.accounts.capabilities import facebook_publishing_issue
+from app.api.youtube_auth import youtube_account_state
 
 router = APIRouter(prefix="/api", tags=["meta"])
 log = logging.getLogger("dfb.meta_callback")
@@ -58,12 +59,14 @@ def meta_error(stage, response, result, secrets_to_redact=()):
 
 def configured():
     cfg = settings()
-    if not cfg.meta_app_id or not cfg.meta_app_secret or not cfg.meta_redirect_uri.startswith("https://"):
-        raise DomainError("Set DFB_META_APP_ID, DFB_META_APP_SECRET, and an HTTPS DFB_META_REDIRECT_URI in .env")
+    redirect = public_callback_url("/api/meta/callback", cfg.meta_redirect_uri)
+    if not cfg.meta_app_id or not cfg.meta_app_secret or not redirect.startswith("https://"):
+        raise DomainError("Set DFB_META_APP_ID, DFB_META_APP_SECRET, and an HTTPS DFB_PUBLIC_ORIGIN or callback URI in .env")
     if not cfg.meta_config_id:
         raise DomainError("Set DFB_META_CONFIG_ID for Facebook Login for Business in .env")
     if not cfg.encryption_key:
         raise DomainError("Set DFB_ENCRYPTION_KEY before connecting Meta")
+    cfg.meta_redirect_uri = redirect
     return cfg
 
 
@@ -104,6 +107,20 @@ def token_metadata(token, *, stage="credential_validation"):
 def account_view(account):
     config = account.config or {}
     facebook_issue = facebook_publishing_issue(account) if account.platform == "facebook" else None
+    if account.platform == "youtube":
+        publishing_status = youtube_account_state(account)
+        publishing_reason = "Additional authorization required for YouTube publishing." if publishing_status == "READ-ONLY" else (
+            "Credential is unhealthy; check connection" if publishing_status == "CREDENTIAL UNHEALTHY" else "")
+        return {"id": account.id, "platform": account.platform, "account_id": account.account_id,
+                "enabled": account.enabled, "token_configured": has_credential(account),
+                "name": config.get("name", ""), "source": config.get("source", "manual"),
+                "permissions": config.get("permissions", []), "tasks": config.get("tasks", []),
+                "token_status": config.get("token_status", "unchecked"),
+                "expires_at": config.get("expires_at"), "data_access_expires_at": config.get("data_access_expires_at"),
+                "token_type": config.get("token_type", ""),
+                "last_checked": config.get("last_checked"),
+                "publishing_status": publishing_status,
+                "publishing_reason": publishing_reason}
     publishing_status = ("UNHEALTHY" if not account.enabled or config.get("token_status") != "healthy"
                          or not config.get("last_checked") or not has_credential(account)
                          or (config.get("expires_at") and config["expires_at"] <= utcnow().timestamp())

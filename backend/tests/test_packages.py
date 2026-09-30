@@ -11,6 +11,7 @@ from app.packages.schemas import PackageInput, VideoPlan
 from app.accounts.capabilities import provider_view
 from app.models import PlatformAccount
 from app.api import youtube_auth
+from app.api.meta_auth import account_view
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -141,3 +142,18 @@ def test_youtube_oauth_requests_only_readonly_and_discovers_unselected(db, monke
     assert response.status_code == 303
     discovered = db.scalars(select(PlatformAccount).where(PlatformAccount.platform == "youtube")).all()
     assert len(discovered) == 2 and all(not row.enabled for row in discovered)
+
+
+def test_youtube_account_state_requires_upload_scope_and_allows_ready_status():
+    read_only = PlatformAccount(id=1, brand_id=1, platform="youtube", account_id="channel-readonly",
+        token_encrypted="secret", enabled=True, config={"name": "Owner channel", "token_status": "healthy",
+        "permissions": [youtube_auth.READONLY_SCOPE], "expires_at": 9999999999, "last_checked": "2026-01-01Z"})
+    ready = PlatformAccount(id=2, brand_id=1, platform="youtube", account_id="channel-ready",
+        token_encrypted="secret", enabled=True, config={"name": "Owner channel", "token_status": "healthy",
+        "permissions": [youtube_auth.READONLY_SCOPE, youtube_auth.UPLOAD_SCOPE], "expires_at": 9999999999,
+        "last_checked": "2026-01-01Z"})
+    assert account_view(read_only)["publishing_status"] == "READ-ONLY"
+    assert account_view(read_only)["publishing_reason"] == "Additional authorization required for YouTube publishing."
+    view = provider_view("youtube", [read_only, ready])
+    assert view["connection"] == "PUBLISHING READY"
+    assert set(view["capabilities"]) >= {"CAN_PUBLISH_SHORT_VIDEO", "CAN_PUBLISH_LONG_VIDEO"}

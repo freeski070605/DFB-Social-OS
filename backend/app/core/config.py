@@ -13,7 +13,8 @@ class Settings(BaseSettings):
     ollama_url: str = "http://127.0.0.1:11434"
     encryption_key: str = ""
     cookie_secure: bool = False
-    allowed_origins: list[str] = ["http://127.0.0.1:8000", "http://localhost:8000", "http://localhost:5173", "http://127.0.0.1:5173"]
+    public_origin: str = "https://dfb-social-os.vercel.app"
+    allowed_origins: list[str] = ["http://127.0.0.1:8000", "http://localhost:8000", "http://localhost:5173", "http://127.0.0.1:5173", "https://dfb-social-os.vercel.app"]
     public_media_provider: str = "local_unavailable"
     s3_endpoint: str = ""
     s3_bucket: str = ""
@@ -45,6 +46,17 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"v\d+\.\d+", value):
             raise ValueError("Meta version must have form v23.0")
         return value
+
+
+def public_callback_url(path: str, configured: str = "") -> str:
+    cfg = settings()
+    candidate = configured.strip() if isinstance(configured, str) else ""
+    public = (cfg.public_origin or "").strip().rstrip("/")
+    if candidate and not candidate.startswith(("http://127.0.0.1", "http://localhost", "http://0.0.0.0")):
+        return candidate.rstrip("/")
+    if public:
+        return public.rstrip("/") + path
+    return candidate.rstrip("/") if candidate else path
 
 
 @lru_cache

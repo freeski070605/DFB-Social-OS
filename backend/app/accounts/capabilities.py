@@ -13,7 +13,7 @@ PROVIDERS = {
         "CAN_PUBLISH_CAROUSEL", "CAN_FETCH_COMMENTS", "CAN_REPLY", "CAN_FETCH_ANALYTICS")},
     "instagram": {"state": "SUPPORTED", "capabilities": ("CAN_PUBLISH_IMAGE", "CAN_PUBLISH_CAROUSEL",
         "CAN_FETCH_COMMENTS", "CAN_REPLY", "CAN_FETCH_ANALYTICS")},
-    "youtube": {"state": "SUPPORTED", "capabilities": ()},
+    "youtube": {"state": "SUPPORTED", "capabilities": ("CAN_PUBLISH_SHORT_VIDEO", "CAN_PUBLISH_LONG_VIDEO")},
     "tiktok": {"state": "PLANNED", "capabilities": ()},
     "threads": {"state": "PLANNED", "capabilities": ()},
 }
@@ -34,11 +34,38 @@ def facebook_publishing_issue(account):
     return None
 
 
+def youtube_publishing_issue(account):
+    config = account.config or {}
+    scopes = set(config.get("permissions") or [])
+    if "https://www.googleapis.com/auth/youtube.upload" not in scopes:
+        return "Additional authorization required for YouTube publishing."
+    return None
+
+
 def provider_view(platform, accounts: list[PlatformAccount]):
     spec = PROVIDERS[platform]
     active = [a for a in accounts if a.platform == platform and a.enabled and
               has_credential(a) and (a.config or {}).get("token_status") == "healthy" and
               (not (a.config or {}).get("expires_at") or (a.config or {})["expires_at"] > utcnow().timestamp())]
+    if platform == "youtube":
+        if active:
+            ready = any("https://www.googleapis.com/auth/youtube.upload" in set((a.config or {}).get("permissions") or []) for a in active)
+            scopes = set((active[0].config or {}).get("permissions") or [])
+            if ready:
+                state = "PUBLISHING READY"
+                capabilities = list(spec["capabilities"])
+            elif scopes:
+                state = "READ-ONLY"
+                capabilities = []
+            else:
+                state = "CONNECTED"
+                capabilities = []
+        else:
+            state = "CONNECTED" if spec["state"] == "SUPPORTED" and any(a.platform == platform for a in accounts) else "NOT_CONNECTED"
+            capabilities = []
+        return {"platform": platform, "support": spec["state"], "connection": state,
+                "capabilities": capabilities,
+                "account_count": sum(a.platform == platform for a in accounts)}
     state = "CONNECTED" if spec["state"] == "SUPPORTED" and len(active) == 1 else (
         "NEEDS_ATTENTION" if spec["state"] == "SUPPORTED" and any(a.platform == platform for a in accounts)
         else "NOT_CONNECTED")

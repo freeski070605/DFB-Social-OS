@@ -1,4 +1,4 @@
-"""Read-only YouTube channel discovery. Upload permission is deliberately not requested."""
+"""YouTube channel discovery and upload-capable OAuth scope handling."""
 import hashlib
 import secrets
 from datetime import timedelta
@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 
 from app.audit.service import record
-from app.core.config import settings
+from app.core.config import settings, public_callback_url
 from app.core.errors import DomainError, ProviderError
 from app.db.session import get_db, utcnow
 from app.models import Brand, PlatformAccount, SystemSetting
@@ -19,15 +19,39 @@ from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 
 router = APIRouter(prefix="/api", tags=["youtube"])
-SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+SCOPE = " ".join((READONLY_SCOPE, UPLOAD_SCOPE))
+
+
+def granted_scopes(value):
+    if not value:
+        return set()
+    if isinstance(value, str):
+        items = value.split()
+    else:
+        items = list(value)
+    return {item.strip() for item in items if item and str(item).strip()}
+
+
+def youtube_account_state(account):
+    config = account.config or {}
+    scopes = set(config.get("permissions") or [])
+    if not account.enabled or config.get("token_status") != "healthy" or not config.get("last_checked") or not config.get("expires_at") or config["expires_at"] <= utcnow().timestamp():
+        return "CREDENTIAL UNHEALTHY"
+    if UPLOAD_SCOPE not in scopes:
+        return "READ-ONLY"
+    return "PUBLISHING READY"
 
 
 def configured():
     cfg = settings()
-    if not cfg.youtube_client_id or not cfg.youtube_client_secret or not cfg.youtube_redirect_uri:
-        raise DomainError("Configure YouTube OAuth client ID, secret and redirect URI first")
+    redirect = public_callback_url("/api/youtube/callback", cfg.youtube_redirect_uri)
+    if not cfg.youtube_client_id or not cfg.youtube_client_secret:
+        raise DomainError("Configure YouTube OAuth client ID and secret first")
     if not cfg.encryption_key:
         raise DomainError("Configure encryption before connecting YouTube")
+    cfg.youtube_redirect_uri = redirect
     return cfg
 
 
@@ -92,7 +116,8 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
             token = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise ProviderError("YouTube token exchange failed") from exc
-    if SCOPE not in token.get("scope", "").split() or not token.get("access_token"):
+    granted = granted_scopes(token.get("scope", ""))
+    if not token.get("access_token") or (READONLY_SCOPE not in granted and UPLOAD_SCOPE not in granted):
         raise ProviderError("YouTube channel read permission was not granted")
     found = channels(token["access_token"])
     count = 0
@@ -111,7 +136,7 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         account.enabled = False
         account.token_encrypted = encrypt(token["access_token"])
         account.config = {"source": "oauth", "name": row.get("snippet", {}).get("title", ""),
-            "permissions": [SCOPE], "token_status": "healthy",
+            "permissions": sorted(granted), "token_status": "healthy",
             "expires_at": int(utcnow().timestamp()) + int(token.get("expires_in", 0)),
             "refresh_token_encrypted": encrypt(token["refresh_token"]) if token.get("refresh_token") else (account.config or {}).get("refresh_token_encrypted"),
             "last_checked": utcnow().isoformat() + "Z"}

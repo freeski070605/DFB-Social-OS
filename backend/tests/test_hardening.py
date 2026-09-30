@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 from app.api import meta_auth
+from app.core import config as core_config
 from app.audit import service as audit
 from app.core.config import Settings
 from app.core.logging import MetaCallbackAccessFilter
@@ -98,6 +99,23 @@ def test_meta_business_login_exchanges_and_discovers_without_selecting_or_publis
         with pytest.raises(DomainError, match="state validation failed"):
             meta_auth.callback(request, code="authorization-code", state=state, admin=admin, db=db)
     engine.dispose()
+
+
+def test_public_oauth_redirect_prefers_public_origin(monkeypatch):
+    monkeypatch.setattr(core_config, "settings", lambda: SimpleNamespace(public_origin="https://dfb-social-os.vercel.app", allowed_origins=["https://dfb-social-os.vercel.app"]))
+    assert core_config.public_callback_url("/api/youtube/callback", "http://127.0.0.1:8000/api/youtube/callback") == "https://dfb-social-os.vercel.app/api/youtube/callback"
+
+
+def test_local_oauth_redirect_keeps_local_development_origin(monkeypatch):
+    monkeypatch.setattr(core_config, "settings", lambda: SimpleNamespace(public_origin="", allowed_origins=["http://127.0.0.1:8000"]))
+    assert core_config.public_callback_url("/api/youtube/callback", "http://127.0.0.1:8000/api/youtube/callback") == "http://127.0.0.1:8000/api/youtube/callback"
+
+
+def test_authenticated_requires_session_cookie(monkeypatch):
+    request = SimpleNamespace(cookies={}, method="POST", headers={"x-csrf-token": "csrf"}, state=SimpleNamespace())
+    with pytest.raises(DomainError, match="Sign in to continue"):
+        from app.security.auth import authenticated
+        authenticated(request, db=SimpleNamespace(get=lambda *args, **kwargs: None))
 
 
 def test_meta_graph_rejects_provider_error_without_logging_credentials(monkeypatch, caplog):
