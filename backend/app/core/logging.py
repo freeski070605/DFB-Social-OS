@@ -21,9 +21,9 @@ class MetaCallbackAccessFilter(logging.Filter):
         # Uvicorn's access record includes the full path and query as argument 3.
         if isinstance(record.args, tuple) and len(record.args) >= 3:
             path = record.args[2]
-            if isinstance(path, str) and urlsplit(path).path == "/api/meta/callback":
+            if isinstance(path, str) and urlsplit(path).path in {"/api/meta/callback", "/api/youtube/callback"}:
                 args = list(record.args)
-                args[2] = "/api/meta/callback"
+                args[2] = urlsplit(path).path
                 record.args = tuple(args)
         return True
 

@@ -36,6 +36,7 @@ export default {
 
     const headers = new Headers(request.headers)
     for (const name of excludedRequestHeaders) headers.delete(name)
+    headers.set('x-dfb-public-origin', incoming.origin)
     const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
 
     try {

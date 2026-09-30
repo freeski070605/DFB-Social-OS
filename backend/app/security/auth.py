@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 from datetime import timedelta
 from argon2 import PasswordHasher
@@ -64,6 +65,11 @@ def authenticated(request: Request, db=Depends(get_db)):
     token = request.cookies.get("dfb_session", "")
     session = db.get(AdminSession, hashlib.sha256(token.encode()).hexdigest()) if token else None
     if not session or session.expires_at < utcnow():
+        if getattr(getattr(request, "url", None), "path", None) == "/api/youtube/callback":
+            logging.getLogger("dfb.youtube_oauth").info(
+                "youtube_oauth_callback category=SESSION_MISSING cookie_present=%s session_record_found=%s callback_host=%s browser_origin=%s",
+                bool(token), bool(session), getattr(request.url, "hostname", "unavailable"),
+                request.headers.get("x-dfb-public-origin", "unavailable"))
         raise DomainError("Sign in to continue", 401)
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
         if not secrets.compare_digest(request.headers.get("x-csrf-token", ""), session.csrf):

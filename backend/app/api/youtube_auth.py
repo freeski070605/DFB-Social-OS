@@ -1,5 +1,7 @@
 """YouTube channel discovery and upload-capable OAuth scope handling."""
 import hashlib
+import json
+import logging
 import secrets
 from datetime import timedelta
 from urllib.parse import urlencode
@@ -7,7 +9,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.audit.service import record
 from app.core.config import settings, public_callback_url
@@ -19,6 +21,7 @@ from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 
 router = APIRouter(prefix="/api", tags=["youtube"])
+log = logging.getLogger("dfb.youtube_oauth")
 READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
 UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
 SCOPE = " ".join((READONLY_SCOPE, UPLOAD_SCOPE))
@@ -47,12 +50,33 @@ def youtube_account_state(account):
 def configured():
     cfg = settings()
     redirect = public_callback_url("/api/youtube/callback", cfg.youtube_redirect_uri)
+    if getattr(cfg, "public_origin", "") and redirect != cfg.public_origin.rstrip("/") + "/api/youtube/callback":
+        raise DomainError("YouTube OAuth callback must use the configured public origin")
     if not cfg.youtube_client_id or not cfg.youtube_client_secret:
         raise DomainError("Configure YouTube OAuth client ID and secret first")
     if not cfg.encryption_key:
         raise DomainError("Configure encryption before connecting YouTube")
     cfg.youtube_redirect_uri = redirect
     return cfg
+
+
+def diagnostic(stage, **fields):
+    log.info("youtube_oauth %s", json.dumps({"stage": stage, **fields}, sort_keys=True))
+
+
+def browser_origin(request):
+    headers = getattr(request, "headers", {})
+    return headers.get("x-dfb-public-origin", "")
+
+
+def consume_state(db, pending, digest):
+    result = db.execute(delete(SystemSetting).where(SystemSetting.key == pending.key))
+    if result.rowcount != 1:
+        db.rollback()
+        return False
+    db.add(SystemSetting(key="youtube_used:" + digest, value={"consumed_at": utcnow().isoformat()}))
+    db.commit()
+    return True
 
 
 def channels(token):
@@ -82,12 +106,23 @@ def inspect_account(account):
 def start(brand_id: int, request: Request, admin=Depends(authenticated), db=Depends(get_db)):
     cfg = configured()
     require(db, Brand, brand_id)
+    origin = browser_origin(request)
+    if origin and origin != getattr(cfg, "public_origin", "").rstrip("/"):
+        diagnostic("start", category="REDIRECT_MISMATCH", browser_origin=origin,
+                   redirect_uri=cfg.youtube_redirect_uri)
+        raise DomainError("YouTube OAuth must start from the production application", 403)
     state = secrets.token_urlsafe(32)
+    now = utcnow()
     db.add(SystemSetting(key="youtube_oauth:" + hashlib.sha256(state.encode()).hexdigest(),
         value={"brand_id": brand_id, "admin_id": admin.id, "session_hash": request.state.session.token_hash,
-               "expires_at": (utcnow() + timedelta(minutes=10)).isoformat()}))
+               "created_at": now.isoformat(), "expires_at": (now + timedelta(minutes=10)).isoformat(),
+               "redirect_uri": cfg.youtube_redirect_uri}))
     record(db, "youtube.connect_start", brand_id, brand_id, admin.username)
     db.commit()
+    diagnostic("start", authenticated=True, browser_origin=origin or "unavailable",
+               redirect_uri=cfg.youtube_redirect_uri, state_record_created=True,
+               created_at=now.isoformat(), expires_at=(now + timedelta(minutes=10)).isoformat(),
+               bound_admin_id=admin.id, session_bound=True, storage="sqlite_system_settings")
     params = {"client_id": cfg.youtube_client_id, "redirect_uri": cfg.youtube_redirect_uri,
               "response_type": "code", "scope": SCOPE, "state": state, "access_type": "offline",
               "include_granted_scopes": "true"}
@@ -98,13 +133,45 @@ def start(brand_id: int, request: Request, admin=Depends(authenticated), db=Depe
 def callback(request: Request, code: str = "", state: str = "", error: str = "",
              admin=Depends(authenticated), db=Depends(get_db)):
     cfg = configured()
-    key = "youtube_oauth:" + hashlib.sha256(state.encode()).hexdigest()
+    digest = hashlib.sha256(state.encode()).hexdigest()
+    key = "youtube_oauth:" + digest
     pending = db.get(SystemSetting, key) if state else None
-    if not pending or pending.value.get("admin_id") != admin.id or pending.value.get("session_hash") != request.state.session.token_hash or pending.value.get("expires_at", "") < utcnow().isoformat():
+    used = db.get(SystemSetting, "youtube_used:" + digest) if state and not pending else None
+    origin = browser_origin(request)
+    value = pending.value if pending and isinstance(pending.value, dict) else {}
+    category = None
+    if not pending:
+        category = "STATE_ALREADY_CONSUMED" if used else "STATE_NOT_FOUND"
+    elif not all(value.get(field) for field in ("admin_id", "session_hash", "expires_at", "brand_id")):
+        category = "OTHER_VALIDATION_FAILURE"
+    elif value["expires_at"] < utcnow().isoformat():
+        category = "STATE_EXPIRED"
+    elif value.get("admin_id") != admin.id or value.get("session_hash") != request.state.session.token_hash:
+        category = "SESSION_MISMATCH"
+    elif value.get("redirect_uri", cfg.youtube_redirect_uri) != cfg.youtube_redirect_uri or (origin and origin != getattr(cfg, "public_origin", "").rstrip("/")):
+        category = "REDIRECT_MISMATCH"
+    if category:
+        if pending and not consume_state(db, pending, digest):
+            category = "STATE_ALREADY_CONSUMED"
+        diagnostic("callback_validation", category=category, authenticated=True,
+                   callback_host=getattr(getattr(request, "url", None), "hostname", "unavailable"),
+                   browser_origin=origin or "unavailable", state_record_found=bool(pending),
+                   state_created_at=value.get("created_at"), state_expires_at=value.get("expires_at"),
+                   state_expired=category == "STATE_EXPIRED", state_consumed=bool(used),
+                   bound_admin_id=value.get("admin_id"), session_binding_matched=(value.get("session_hash") == request.state.session.token_hash) if pending else None,
+                   redirect_uri=cfg.youtube_redirect_uri, state_redirect_uri=value.get("redirect_uri"))
         raise DomainError("YouTube connection expired or state validation failed", 403)
     brand_id = pending.value["brand_id"]
-    db.delete(pending)
-    db.commit()
+    if not consume_state(db, pending, digest):
+        diagnostic("callback_validation", category="STATE_ALREADY_CONSUMED", authenticated=True)
+        raise DomainError("YouTube connection expired or state validation failed", 403)
+    diagnostic("callback_validation", category="PASSED", authenticated=True,
+               callback_host=getattr(getattr(request, "url", None), "hostname", "unavailable"),
+               browser_origin=origin or "unavailable", state_record_found=True,
+               state_created_at=value.get("created_at"), state_expires_at=value.get("expires_at"),
+               state_expired=False, state_consumed=False, bound_admin_id=value.get("admin_id"),
+               session_binding_matched=True, redirect_uri=cfg.youtube_redirect_uri,
+               state_redirect_uri=value.get("redirect_uri"))
     if error or not code:
         raise DomainError("YouTube authorization was denied or cancelled")
     try:
