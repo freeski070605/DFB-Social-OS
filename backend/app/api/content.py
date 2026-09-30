@@ -306,6 +306,9 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
     plan_token = None
     if not reasons:
         plan_token = secrets.token_hex(16)
+        expires_at = (utcnow() + timedelta(minutes=30)).isoformat()
+        for platform_plan in plan:
+            platform_plan["expires_at"] = expires_at
         if item.assets:
             marker = dry_run_get(db, SystemSetting, "r2_media_health", "health_marker_lookup")
             if marker is None:
@@ -318,7 +321,7 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
             "destination_ids": {platform: accounts[platform].account_id for platform in data.platforms},
             "facebook_plan": facebook_publication_plan(item, accounts["facebook"]) if "facebook" in accounts else None,
             "exact_caption": caption(item), "media_keys": [a["key"] for a in item.assets],
-            "expires_at": (utcnow() + timedelta(minutes=30)).isoformat()}))
+            "expires_at": expires_at}))
     dry_run_commit(db, "dry_run_result")
     return {"status": "BLOCKED" if reasons else "READY", "reasons": reasons, "plan": plan, "plan_token": plan_token}
 

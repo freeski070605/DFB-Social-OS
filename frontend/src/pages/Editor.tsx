@@ -1,20 +1,32 @@
-import {useEffect,useState} from 'react'
+import {Component,useEffect,useState,type ReactNode} from 'react'
 import {Plus, Trash2, Sparkles, Paintbrush, Save, Download} from 'lucide-react'
 import {api,apiUrl,brandPath,formats,kinds,label} from '../services/api'
 import {readableError} from '../services/validation'
 import {eligibleCandidates} from '../services/knowledgeCandidates'
+import {normalizeDryRunResponse,requestError,type PublishingPlatform,type PublishingResult} from '../services/publishing'
 import {useData} from '../hooks/useData'
 import {Badge,Field,Panel,useAction,Status} from '../components/ui'
 import type {Account,Brand,Content,Job,Knowledge,Publication,Slide} from '../types'
 
 type Draft=Pick<Content,'topic'|'pillar'|'format'|'hook'|'body'|'slides'|'caption'|'cta'|'hashtags'|'knowledge_refs'|'sources'|'targets'|'parent_id'>
-type DryRunResult={status:string;reasons:string[];plan_token:string|null;plan:{platform:string;account_name:string;caption:string;media_count:number;revision:number;action:string;graph_steps:{method:string;path:string;purpose:string}[]}[]}
+class PublishingResultBoundary extends Component<{platform:PublishingPlatform;resetKey:unknown;children:ReactNode},{hasError:boolean}> {
+ state={hasError:false}
+ static getDerivedStateFromError(){return {hasError:true}}
+ componentDidUpdate(previous:{platform:PublishingPlatform;resetKey:unknown;children:ReactNode}){
+  if(this.state.hasError&&previous.resetKey!==this.props.resetKey)this.setState({hasError:false})
+ }
+ render(){
+  if(this.state.hasError)return <p role="alert" className="error">{this.props.platform==='facebook'?'Facebook':'Instagram'} dry-run result could not be displayed.</p>
+  return this.props.children
+ }
+}
+
 const fresh=(brand:Brand):Draft=>({topic:'',pillar:brand.config.pillars[0]||'General',format:'carousel',hook:'',body:'',slides:[{title:'',body:'',kind:'cover',items:[]}],caption:'',cta:'',hashtags:[],knowledge_refs:[],sources:[],targets:brand.config.platforms,parent_id:null})
 const normalized=(value:string)=>value.normalize('NFKC').replace(/\s+/g,' ').trim().toLocaleLowerCase()
 export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navigate:(page:string,id?:number)=>void}) {
  const [draft,setDraft]=useState<Draft>(fresh(brand)),[item,setItem]=useState<Content|null>(null),[candidates,setCandidates]=useState<{key:string;items:Knowledge[];loading:boolean;error:string}>({key:'',items:[],loading:false,error:''}),[when,setWhen]=useState(''),[override,setOverride]=useState(false),[reason,setReason]=useState(''),[tab,setTab]=useState('Write'),[error,setError]=useState(''),[generationStatus,setGenerationStatus]=useState('')
- const [publishAccounts,setPublishAccounts]=useState<Account[]>([]),[selectedPlatforms,setSelectedPlatforms]=useState<string[]>([])
- const [dryRuns,setDryRuns]=useState<Record<string,DryRunResult>>({})
+ const [publishAccounts,setPublishAccounts]=useState<Account[]>([]),[selectedPlatforms,setSelectedPlatforms]=useState<PublishingPlatform[]>([])
+ const [dryRuns,setDryRuns]=useState<Partial<Record<PublishingPlatform,PublishingResult>>>({})
  const {busy,run}=useAction(),path=(suffix:string)=>brandPath(brand.id,suffix)
  const {data: controls} = useData<{global_paused:boolean;brand_paused:boolean}>(`/system?brand_id=${brand.id}`)
  const {data: receipts,reload: reloadReceipts} = useData<Publication[]>(path('/publications'))
@@ -88,11 +100,12 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
   <p><strong>Exact caption:</strong></p><pre className="json-view">{exactCaption||item?.body||'None'}</pre>
   <div className="preview-grid">{item?.assets.map((asset,index)=><img key={asset.key} src={apiUrl('/media/'+asset.key)} alt={`Exact rendered media ${index+1}`}/>)}</div>
   <button disabled={busy||!id||!selectedPlatforms.length||!['APPROVED','PUBLISHED'].includes(item?.status||'')} onClick={()=>run(async()=>{
-   const results:Record<string,DryRunResult>={}
+   setDryRuns({})
+   const results:Partial<Record<PublishingPlatform,PublishingResult>>={}
    for(const platform of selectedPlatforms){
     const account=publishAccounts.find(a=>a.platform===platform&&a.enabled)
-    try{results[platform]=await api<DryRunResult>(path(`/content/${id}/publish-dry-run`),'POST',{platforms:[platform],account_ids:{[platform]:account?.id}})}
-    catch(error){results[platform]={status:'BLOCKED',reasons:[readableError(error)],plan_token:null,plan:[]}}
+    try{results[platform]=normalizeDryRunResponse(await api<unknown>(path(`/content/${id}/publish-dry-run`),'POST',{platforms:[platform],account_ids:{[platform]:account?.id}}),platform,item?.assets||[])}
+    catch(error){results[platform]=requestError(platform,readableError(error))}
    }
    setDryRuns(results)
   },'Destination dry runs finished')}>Run selected dry runs</button>
@@ -101,24 +114,25 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
    const receipt=receipts?.find(p=>p.content_id===item?.id&&p.platform===platform)
    const account=publishAccounts.find(a=>a.platform===platform&&a.enabled)
    const publishedAt=(receipt?.request_state as {published_at?:string}|undefined)?.published_at
-   return <div key={platform} role="status">
+    return <PublishingResultBoundary key={platform} platform={platform} resetKey={result}><div role="status">
     <h3>{platform==='facebook'?'Facebook':'Instagram'}: {result?.status||'Not checked'}</h3>
     {account?.publishing_reason&&<p className="notice">{account.publishing_reason}</p>}
-    {result?.reasons.map(reason=><p className="error" key={reason}>{reason}</p>)}
-    {result?.plan.map(plan=><div key={plan.platform}><p>{plan.action} | {plan.account_name}: {plan.media_count} images | {plan.caption}</p>{plan.graph_steps.length>0&&<p className="muted">Graph plan: {plan.graph_steps.map(step=>`${step.method} /${step.path} (${step.purpose})`).join(' | ')}</p>}</div>)}
+    {result?.status==='ERROR'&&<p role="alert" className="error">{result.message}</p>}
+    {result?.blockers.map(reason=><p className="error" key={reason}>{reason}</p>)}
+    {result?.status==='READY'&&<div><p>{result.action} | {result.destination}: {result.media_count} images | {result.text}</p>{result.graph_steps.length>0&&<p className="muted">Graph plan: {result.graph_steps.map(step=>`${step.method} /${step.path} (${step.purpose})`).join(' | ')}</p>}</div>}
     {receipt&&<p><strong>{receipt.state}</strong> | {platform==='facebook'?'Facebook':'Instagram'} | {account?.name||brand.name}{receipt.external_id&&<> | Provider publication ID: <code>{receipt.external_id}</code></>}{publishedAt&&<> | Published: {new Date(publishedAt).toLocaleString()}</>}</p>}
     {result?.status==='READY'&&<>
      <p className="notice">{brand.paused||controls?.brand_paused?'Brand outward actions must be active for a real manual publish.':controls?.global_paused?'Autonomous actions are paused. This owner-confirmed manual publish is still allowed.':'Brand outward actions are active for this owner-confirmed manual publish.'}</p>
      <button className="primary" disabled={busy||!item||brand.paused||controls?.brand_paused} onClick={()=>{
       if(window.confirm(`Final confirmation: publish content #${item?.id} for ${brand.name} to ${platform}?
 
-${platform==='facebook'?(result.plan[0]?.caption||item?.body):exactCaption}`))void run(async()=>{
+${platform==='facebook'?(result.text||item?.body):exactCaption}`))void run(async()=>{
        const published=await api<Content>(path(`/content/${id}/manual-meta-publish`),'POST',{platforms:[platform],account_ids:{[platform]:account?.id},revision:item?.revision,exact_caption:exactCaption,media_keys:item?.assets.map(a=>a.key),plan_token:result.plan_token,confirmed:true})
        setItem(published);setDryRuns(previous=>{const next={...previous};delete next[platform];return next});await reloadReceipts()
       },`${platform==='facebook'?'Facebook':'Instagram'} manual publish completed`)
      }}>Final confirmation: publish to {platform==='facebook'?'Facebook':'Instagram'}</button>
     </>}
-   </div>
+    </div></PublishingResultBoundary>
   })}
  </Panel>
  {item&&<Panel title="Editorial review">{editorialReview?<><p className="muted">{editorialReview.note}</p><div className="stack">{Object.entries(editorialReview.dimensions).map(([name,part])=><div key={name}><strong>{label(name)}</strong> {part.score}/{part.max}</div>)}</div>{editorialReview.issues.map(issue=><p className="notice" key={issue}>{issue}</p>)}</>:<p className="muted">Save or generate content to see editorial signals.</p>}{provenance?.knowledge?.length?<><p><strong>Knowledge used</strong></p>{provenance.knowledge.map(ref=><p key={ref.id}>#{ref.id} {ref.title}{ref.source?` · ${ref.source}`:''}</p>)}</>:null}{provenance?.ai_revised!==undefined&&<p className="muted">AI revision pass: {provenance.ai_revised?'Used once':'Not needed'}</p>}</Panel>}

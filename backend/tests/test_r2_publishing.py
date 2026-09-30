@@ -196,7 +196,8 @@ def test_facebook_text_dry_run_ready_without_meta_mutation(monkeypatch):
         result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
             account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
         assert result["status"] == "READY" and result["plan"][0]["action"] == "Facebook Page text"
-        assert db.get(SystemSetting, "manual_publish_plan:" + result["plan_token"])
+        saved_plan = db.get(SystemSetting, "manual_publish_plan:" + result["plan_token"])
+        assert saved_plan and result["plan"][0]["expires_at"] == saved_plan.value["expires_at"]
         assert not db.query(Publication).count()
         data = content_api.ManualPublishInput(platforms=["facebook"], account_ids={"facebook": 1},
             revision=1, exact_caption="Caption", media_keys=[], plan_token=result["plan_token"], confirmed=True)
