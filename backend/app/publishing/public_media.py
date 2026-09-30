@@ -21,20 +21,24 @@ class PublicMediaProvider(Protocol):
 
 def approved_asset(content, asset: dict) -> bytes:
     if content.status not in {"APPROVED", "SCHEDULED", "PUBLISHING"}:
-        raise ProviderError("Approve content before preparing public media")
+        raise ProviderError("ASSET_APPROVAL_MISMATCH: Approve content before preparing public media")
     if asset not in content.assets or not isinstance(asset, dict):
-        raise ProviderError("Only approved rendered publishing images can be sent to a public media provider")
+        raise ProviderError("ASSET_APPROVAL_MISMATCH: Only approved rendered publishing images can be sent to a public media provider")
     key, digest = asset.get("key", ""), asset.get("sha256", "")
     pattern = rf"[a-z0-9_-]+/{content.id}/r{content.revision}-[0-9]+-([0-9a-f]{{24}})\.(png|jpe?g)"
     match = re.fullmatch(pattern, key) if isinstance(key, str) else None
     if not match or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or digest[:24] != match[1]:
-        raise ProviderError("Only approved rendered publishing images can be sent to a public media provider")
+        raise ProviderError("ASSET_APPROVAL_MISMATCH: Only approved rendered publishing images can be sent to a public media provider")
     try:
         data = LocalStorage().read(key)
+    except FileNotFoundError:
+        raise ProviderError("LOCAL_ASSET_MISSING: Rendered publishing image is missing; render it again before publishing") from None
     except OSError:
-        raise ProviderError("Rendered publishing image is missing; render it again before publishing")
+        raise ProviderError("ASSET_READ_FAILED: Rendered publishing image could not be read") from None
+    if not data:
+        raise ProviderError("EMPTY_MEDIA: Rendered publishing image is empty")
     if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), digest):
-        raise ProviderError("Rendered publishing image checksum failed")
+        raise ProviderError("ASSET_APPROVAL_MISMATCH: Rendered publishing image checksum failed")
     return data
 
 
@@ -118,7 +122,8 @@ class R2PublicMediaProvider:
         self.client = client
 
     def prepare_object(self, content, asset: dict, platform: str | None = None) -> tuple[str, str]:
-        from botocore.exceptions import ClientError, EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError
+        from botocore.exceptions import (ClientError, EndpointConnectionError, ConnectTimeoutError,
+                                        ReadTimeoutError, SSLError, ParamValidationError)
 
         data = approved_asset(content, asset)
         extension = asset["key"].rsplit(".", 1)[1]
@@ -127,7 +132,7 @@ class R2PublicMediaProvider:
         elif extension in {"jpg", "jpeg"} and data.startswith(b"\xff\xd8\xff"):
             mime = "image/jpeg"
         else:
-            raise ProviderError("Rendered asset is not a supported PNG or JPEG image")
+            raise ProviderError("IMAGE_CONVERSION_FAILED: Rendered asset is not a supported PNG or JPEG image")
         if platform == "instagram" and mime == "image/png":
             from PIL import Image, UnidentifiedImageError
             try:
@@ -136,8 +141,10 @@ class R2PublicMediaProvider:
                     image.convert("RGB").save(output, format="JPEG", quality=95, optimize=True)
                     data = output.getvalue()
             except (OSError, UnidentifiedImageError, ValueError):
-                raise ProviderError("Rendered image cannot be converted to Instagram JPEG") from None
+                raise ProviderError("IMAGE_CONVERSION_FAILED: Rendered image cannot be converted to Instagram JPEG") from None
             extension, mime = "jpg", "image/jpeg"
+        if not data:
+            raise ProviderError("EMPTY_MEDIA: Prepared publishing image is empty")
         if platform == "instagram" and len(data) > 8 * 1024 * 1024:
             raise ProviderError("Instagram image exceeds 8 MB")
         key = PREFIX + secrets.token_hex(16) + "." + extension
@@ -149,8 +156,12 @@ class R2PublicMediaProvider:
                 self.client.delete_object(Bucket=self.bucket, Key=key)
             except Exception:
                 pass
+            if isinstance(exc, SSLError):
+                raise ProviderError("R2_ENDPOINT_TLS_FAILED: TLS handshake with the R2 S3 endpoint failed") from None
             if isinstance(exc, (EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError)):
-                raise ProviderError("R2 S3 endpoint connection failed") from None
+                raise ProviderError("R2_PUT_FAILED: R2 S3 endpoint connection failed") from None
+            if isinstance(exc, ParamValidationError):
+                raise ProviderError("R2_PUT_FAILED: Invalid S3 upload parameters") from None
             if isinstance(exc, ClientError):
                 code = exc.response.get("Error", {}).get("Code", "")
                 if code in {"InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "ExpiredToken"}:
@@ -158,8 +169,8 @@ class R2PublicMediaProvider:
                 if code in {"NoSuchBucket", "404"}:
                     raise ProviderError("R2 bucket was not found") from None
                 if code in {"AccessDenied", "AllAccessDisabled"}:
-                    raise ProviderError("R2 media upload was denied") from None
-            raise ProviderError("R2 media upload failed") from None
+                    raise ProviderError("R2_WRITE_DENIED: R2 media upload was denied") from None
+            raise ProviderError("R2_PUT_FAILED: R2 media upload failed (" + type(exc).__name__ + ")") from None
         return key, self.base_url + "/" + quote(key)
 
     def prepare(self, content, asset: dict) -> str:
@@ -171,7 +182,7 @@ class R2PublicMediaProvider:
         try:
             self.client.delete_object(Bucket=self.bucket, Key=key)
         except Exception:
-            raise ProviderError("R2 media cleanup failed", transient=True)
+            raise ProviderError("CLEANUP_FAILED: R2 media cleanup failed", transient=True) from None
 
 
 def public_media_provider() -> PublicMediaProvider:

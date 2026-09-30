@@ -170,8 +170,8 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
         for asset in item.assets:
             try:
                 approved_asset(item, asset)
-            except Exception:
-                reasons.append("Rendered asset failed validation; render again")
+            except ProviderError as exc:
+                reasons.append(exc.message)
                 break
     if reasons:
         return {"status": "BLOCKED", "reasons": reasons, "plan": []}
@@ -195,9 +195,13 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
                     with httpx.Client(timeout=15, trust_env=False, follow_redirects=False) as client:
                         response = client.head(url)
                     if response.status_code != 200:
-                        reasons.append("Public media URL is not accessible over HTTPS (HTTP " + str(response.status_code) + ")")
+                        reasons.append("PUBLIC_FETCH_FAILED: Public media URL returned HTTP " + str(response.status_code))
+                    elif response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
+                            "image/jpeg" if platform == "instagram" or asset["key"].lower().endswith((".jpg", ".jpeg"))
+                            else "image/png"):
+                        reasons.append("PUBLIC_CONTENT_MISMATCH: Public media Content-Type does not match the image")
                 except httpx.HTTPError:
-                    reasons.append("Public media URL accessibility check failed")
+                    reasons.append("PUBLIC_FETCH_FAILED: Public media URL accessibility check failed")
         for platform in data.platforms:
             plan.append({"platform": platform, "account_id": accounts[platform].id,
                          "account_name": (accounts[platform].config or {}).get("name", ""),
@@ -217,7 +221,7 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
                     cleanup.value = {"objects": [value for value in cleanup.value["objects"] if value != object_key]}
                     db.commit()
                 except Exception:
-                    reasons.append("Temporary media cleanup is pending retry")
+                    reasons.append("CLEANUP_FAILED: Temporary media cleanup is pending retry")
         if not cleanup.value["objects"]:
             db.delete(cleanup)
             db.commit()

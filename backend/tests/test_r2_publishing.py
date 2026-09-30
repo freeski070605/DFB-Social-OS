@@ -3,7 +3,7 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, SSLError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -76,7 +76,21 @@ def test_r2_upload_mime_url_rejection_and_delete(monkeypatch, tmp_path):
     fake.fail_upload = True
     with pytest.raises(ProviderError, match="R2 media upload failed") as error:
         provider.prepare_object(item, asset)
+    assert error.value.message.startswith("R2_PUT_FAILED:")
     assert "private" not in str(error.value)
+
+
+def test_r2_tls_failure_has_safe_actionable_category(monkeypatch, tmp_path):
+    configured(monkeypatch, tmp_path)
+
+    class TlsFailure(FakeR2):
+        def put_object(self, **kwargs):
+            raise SSLError(endpoint_url="https://private.example", error="secret upstream response")
+
+    item, asset = rendered(tmp_path)
+    with pytest.raises(ProviderError, match="R2_ENDPOINT_TLS_FAILED") as error:
+        public_media.R2PublicMediaProvider(TlsFailure()).prepare_object(item, asset)
+    assert "private" not in str(error.value) and "secret" not in str(error.value)
 
 
 def test_instagram_rendered_png_is_uploaded_as_jpeg(monkeypatch, tmp_path):
@@ -207,7 +221,7 @@ def test_image_dry_run_verifies_url_and_cleans_without_meta(monkeypatch, tmp_pat
 
         def head(self, url):
             assert url.startswith("https://media.example.com/meta-publish/")
-            return SimpleNamespace(status_code=200)
+            return SimpleNamespace(status_code=200, headers={"content-type": "image/png"})
 
     monkeypatch.setattr(content_api.httpx, "Client", HeadClient)
     with Session(database()) as db:
@@ -223,6 +237,34 @@ def test_image_dry_run_verifies_url_and_cleans_without_meta(monkeypatch, tmp_pat
         assert result["status"] == "READY"
         assert public_media.r2_verified(db)
         assert fake.deleted and not fake.objects
+        assert not db.query(Publication).count()
+
+
+def test_dry_run_exposes_tls_category_without_upstream_details(monkeypatch, tmp_path):
+    configured(monkeypatch, tmp_path)
+    output = BytesIO()
+    Image.new("RGB", (10, 10), "white").save(output, format="PNG")
+    _, asset = rendered(tmp_path, data=output.getvalue())
+
+    class TlsFailure(FakeR2):
+        def put_object(self, **kwargs):
+            raise SSLError(endpoint_url="https://private.example", error="secret upstream response")
+
+    monkeypatch.setattr(content_api, "public_media_provider", lambda: public_media.R2PublicMediaProvider(TlsFailure()))
+    with Session(database()) as db:
+        db.add(Brand(id=1, name="Brand", slug="brand", config={}))
+        db.add(Content(id=1, brand_id=1, topic="Test", pillar="General", status="APPROVED",
+                       format="statement", assets=[asset], caption="Caption", targets=["instagram"]))
+        db.add(PlatformAccount(id=1, brand_id=1, platform="instagram", account_id="123", enabled=True,
+                               token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
+                                   "permissions": ["pages_show_list", "pages_read_engagement", "instagram_basic",
+                                                   "instagram_content_publish"]}))
+        db.commit()
+        result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["instagram"],
+            account_ids={"instagram": 1}), admin=SimpleNamespace(username="owner"), db=db)
+        assert result["status"] == "BLOCKED"
+        assert any(reason.startswith("R2_ENDPOINT_TLS_FAILED:") for reason in result["reasons"])
+        assert "private" not in str(result) and "secret" not in str(result)
         assert not db.query(Publication).count()
 
 
