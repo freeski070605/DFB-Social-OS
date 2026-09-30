@@ -34,7 +34,7 @@ def setup(monkeypatch):
                     format="statement", assets=[], caption="Caption", targets=["facebook"]),
             PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                             token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                          "permissions": ["pages_manage_posts"]}),
+                                                          "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]}),
             SystemSetting(key="autopilot", value={"paused": True}),
         ])
         db.commit()

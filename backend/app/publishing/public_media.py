@@ -7,6 +7,7 @@ import secrets
 from datetime import timedelta
 from io import BytesIO
 from urllib.parse import quote, urlsplit
+from PIL import Image, UnidentifiedImageError
 
 from app.core.config import settings
 from app.core.errors import ProviderError
@@ -20,7 +21,7 @@ class PublicMediaProvider(Protocol):
 
 
 def approved_asset(content, asset: dict) -> bytes:
-    if content.status not in {"APPROVED", "SCHEDULED", "PUBLISHING"}:
+    if content.status not in {"APPROVED", "SCHEDULED", "PUBLISHING", "PUBLISHED"}:
         raise ProviderError("ASSET_APPROVAL_MISMATCH: Approve content before preparing public media")
     if asset not in content.assets or not isinstance(asset, dict):
         raise ProviderError("ASSET_APPROVAL_MISMATCH: Only approved rendered publishing images can be sent to a public media provider")
@@ -39,6 +40,14 @@ def approved_asset(content, asset: dict) -> bytes:
         raise ProviderError("EMPTY_MEDIA: Rendered publishing image is empty")
     if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), digest):
         raise ProviderError("ASSET_APPROVAL_MISMATCH: Rendered publishing image checksum failed")
+    expected_format = "PNG" if key.lower().endswith(".png") else "JPEG"
+    try:
+        with Image.open(BytesIO(data)) as image:
+            if image.format != expected_format or min(image.size) < 1:
+                raise ProviderError("INVALID_MEDIA: Rendered image format does not match its asset record")
+            image.verify()
+    except (OSError, UnidentifiedImageError, ValueError):
+        raise ProviderError("INVALID_MEDIA: Rendered publishing image cannot be decoded") from None
     return data
 
 

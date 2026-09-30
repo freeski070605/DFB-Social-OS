@@ -14,7 +14,7 @@ from app.creative.service import render_content
 from app.scheduling.service import schedule
 from app.content.director import enqueue
 from app.publishing.service import publish, reconcile
-from app.publishing.providers import ManualExportPublisher
+from app.publishing.providers import ManualExportPublisher, facebook_publication_plan
 from app.audit.service import record
 from app.knowledge import bulk as knowledge_bulk
 from app.knowledge import review as knowledge_review
@@ -31,6 +31,7 @@ from app.db.session import utcnow
 from app.approvals.policy import outward_lock, brand_outward_allowed
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm.exc import StaleDataError
+from sqlalchemy import select
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
 log = logging.getLogger("dfb.publishing")
@@ -159,8 +160,11 @@ def manual_meta_publish(brand_id: int, key: int, data: ManualPublishInput,
                         admin=Depends(authenticated), db=Depends(get_db)):
     with outward_lock:
         item = require(db, Content, key, brand_id)
-        if item.status != "APPROVED":
+        if item.status not in {"APPROVED", "PUBLISHED"}:
             raise DomainError("Content must be approved before manual publishing", 409)
+        if item.status == "PUBLISHED" and not db.scalar(select(Publication.id).where(
+                Publication.content_id == item.id, Publication.state == "PUBLISHED")):
+            raise DomainError("Content has no successful publication receipt", 409)
         if item.revision != data.revision or caption(item) != data.exact_caption or [a["key"] for a in item.assets] != data.media_keys:
             raise DomainError("Content changed since preview; review it again", 409)
         if len(set(data.platforms)) != len(data.platforms):
@@ -174,6 +178,16 @@ def manual_meta_publish(brand_id: int, key: int, data: ManualPublishInput,
                     "exact_caption": data.exact_caption, "media_keys": data.media_keys}
         if not saved or saved.value.get("expires_at", "") < utcnow().isoformat() or any(saved.value.get(k) != v for k, v in expected.items()):
             raise DomainError("READY dry run expired or changed; run it again", 409)
+        current_destinations = {}
+        current_facebook_plan = None
+        for platform in data.platforms:
+            account = account_for(db, brand_id, platform)
+            current_destinations[platform] = account.account_id if account and account.id == data.account_ids.get(platform) else None
+            if platform == "facebook" and account:
+                current_facebook_plan = facebook_publication_plan(item, account)
+        if (saved.value.get("destination_ids") != current_destinations or
+                saved.value.get("facebook_plan") != current_facebook_plan):
+            raise DomainError("READY dry run destination or publication plan changed; run it again", 409)
         brand_outward_allowed(db, require(db, Brand, brand_id))
         for asset in item.assets:
             approved_asset(item, asset)
@@ -189,8 +203,11 @@ def manual_meta_publish(brand_id: int, key: int, data: ManualPublishInput,
 def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(authenticated), db=Depends(get_db)):
     item = require(db, Content, key, brand_id)
     reasons = []
-    if item.status != "APPROVED":
+    if item.status not in {"APPROVED", "PUBLISHED"}:
         reasons.append("Content must be approved and unchanged")
+    if item.status == "PUBLISHED" and not db.scalar(select(Publication.id).where(
+            Publication.content_id == item.id, Publication.state == "PUBLISHED")):
+        reasons.append("Content has no successful publication receipt")
     if len(set(data.platforms)) != len(data.platforms):
         reasons.append("Select each platform once")
     accounts = {}
@@ -207,7 +224,13 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
         else:
             accounts[platform] = account
             reasons.extend(platform + ": " + reason for reason in publishing_blockers(item, account, platform))
-    if item.status == "APPROVED":
+            prior = db.scalar(select(Publication).where(Publication.content_id == item.id,
+                    Publication.platform == platform))
+            if prior and prior.state == "PUBLISHED":
+                reasons.append(platform + ": This destination already has a successful publication receipt")
+            elif prior and prior.state in {"UNKNOWN", "SENDING"}:
+                reasons.append(platform + ": Publication needs administrator reconciliation before retry")
+    if item.status in {"APPROVED", "PUBLISHED"}:
         for asset in item.assets:
             try:
                 approved_asset(item, asset)
@@ -227,14 +250,12 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
     uploaded_keys = []
     try:
         provider = public_media_provider() if item.assets else None
-        urls = []
         for platform in data.platforms:
             for asset in item.assets:
                 object_key, url = provider.prepare_object(item, asset, platform)
                 uploaded_keys.append(object_key)
                 cleanup.value = {"objects": uploaded_keys.copy(), "expires_at": cleanup_expires_at}
                 dry_run_commit(db, "media_checkpoint")
-                urls.append(url)
                 try:
                     with httpx.Client(timeout=15, trust_env=False, follow_redirects=False) as client:
                         response = client.head(url)
@@ -247,11 +268,14 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
                 except httpx.HTTPError:
                     reasons.append("PUBLIC_FETCH_FAILED: Public media URL accessibility check failed")
         for platform in data.platforms:
+            facebook_plan = facebook_publication_plan(item, accounts[platform]) if platform == "facebook" else None
             plan.append({"platform": platform, "account_id": accounts[platform].id,
+                         "destination_id": accounts[platform].account_id,
                          "account_name": (accounts[platform].config or {}).get("name", ""),
                          "action": "Instagram image/carousel" if platform == "instagram" else
-                                   "Facebook Page feed with images" if urls else "Facebook Page text feed",
-                         "caption": caption(item) if platform == "instagram" or urls else caption(item) or item.body,
+                                   "Facebook Page " + facebook_plan["mode"].lower().replace("_", " "),
+                         "graph_steps": facebook_plan["graph_steps"] if facebook_plan else [],
+                         "caption": facebook_plan["message"] if facebook_plan else caption(item),
                          "media_count": len(item.assets), "content_id": item.id, "revision": item.revision})
     except ProviderError as exc:
         reasons.append(exc.message)
@@ -291,6 +315,8 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
         db.add(SystemSetting(key="manual_publish_plan:" + plan_token, value={
             "brand_id": brand_id, "content_id": key, "revision": item.revision,
             "platforms": data.platforms, "account_ids": data.account_ids,
+            "destination_ids": {platform: accounts[platform].account_id for platform in data.platforms},
+            "facebook_plan": facebook_publication_plan(item, accounts["facebook"]) if "facebook" in accounts else None,
             "exact_caption": caption(item), "media_keys": [a["key"] for a in item.assets],
             "expires_at": (utcnow() + timedelta(minutes=30)).isoformat()}))
     dry_run_commit(db, "dry_run_result")

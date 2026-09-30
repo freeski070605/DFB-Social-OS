@@ -136,7 +136,12 @@ def test_public_media_fails_closed_for_approved_images_only(tmp_path, monkeypatc
     from app.publishing import public_media
     from app.storage.local import LocalStorage
 
-    data = b"rendered-image"
+    from io import BytesIO
+    from PIL import Image
+
+    output = BytesIO()
+    Image.new("RGB", (2, 2), "white").save(output, format="PNG")
+    data = output.getvalue()
     digest = hashlib.sha256(data).hexdigest()
     asset = {"key": f"brand/1/r1-1-{digest[:24]}.png", "sha256": digest}
     LocalStorage(tmp_path).write(asset["key"], data)

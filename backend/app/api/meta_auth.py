@@ -21,6 +21,7 @@ from app.repositories.common import require
 from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
 from app.accounts.credentials import encrypted_credential, has_credential
+from app.accounts.capabilities import facebook_publishing_issue
 
 router = APIRouter(prefix="/api", tags=["meta"])
 log = logging.getLogger("dfb.meta_callback")
@@ -102,6 +103,12 @@ def token_metadata(token, *, stage="credential_validation"):
 
 def account_view(account):
     config = account.config or {}
+    facebook_issue = facebook_publishing_issue(account) if account.platform == "facebook" else None
+    publishing_status = ("UNHEALTHY" if not account.enabled or config.get("token_status") != "healthy"
+                         or not config.get("last_checked") or not has_credential(account)
+                         or (config.get("expires_at") and config["expires_at"] <= utcnow().timestamp())
+                         or (config.get("data_access_expires_at") and config["data_access_expires_at"] <= utcnow().timestamp()) else
+                         "ADDITIONAL_AUTHORIZATION_REQUIRED" if facebook_issue else "READY")
     return {"id": account.id, "platform": account.platform, "account_id": account.account_id,
             "enabled": account.enabled, "token_configured": has_credential(account),
             "name": config.get("name", ""), "source": config.get("source", "manual"),
@@ -109,7 +116,10 @@ def account_view(account):
             "token_status": config.get("token_status", "unchecked"),
             "expires_at": config.get("expires_at"), "data_access_expires_at": config.get("data_access_expires_at"),
             "token_type": config.get("token_type", ""),
-            "last_checked": config.get("last_checked")}
+            "last_checked": config.get("last_checked"),
+            "publishing_status": publishing_status if account.platform == "facebook" else None,
+            "publishing_reason": ("Credential is unhealthy; check connection" if publishing_status == "UNHEALTHY"
+                                  else facebook_issue or "") if account.platform == "facebook" else ""}
 
 
 def inspect_account(account):

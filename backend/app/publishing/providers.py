@@ -33,6 +33,22 @@ def caption(content):
     return "\n\n".join(x for x in (content.caption, content.cta, " ".join("#" + h.lstrip("#") for h in content.hashtags)) if x)
 
 
+def facebook_publication_plan(content, account):
+    """Describe the Page-native Graph requests bound to one rendered revision."""
+    page_id = account.account_id
+    count = len(content.assets)
+    mode = "TEXT" if count == 0 else "SINGLE_IMAGE" if count == 1 else "MULTI_IMAGE"
+    steps = ([{"method": "POST", "path": f"{page_id}/feed", "purpose": "publish_text"}] if mode == "TEXT" else
+             [{"method": "POST", "path": f"{page_id}/photos", "purpose": "publish_single_photo"}]
+             if mode == "SINGLE_IMAGE" else
+             [{"method": "POST", "path": f"{page_id}/photos", "purpose": "upload_unpublished_photo"}
+              for _ in content.assets] +
+             [{"method": "POST", "path": f"{page_id}/feed", "purpose": "publish_attached_photos"}])
+    return {"provider": "META_GRAPH", "platform": "facebook", "page_id": page_id,
+            "mode": mode, "message": caption(content) or content.body,
+            "media_keys": [asset["key"] for asset in content.assets], "graph_steps": steps}
+
+
 class MetaPublisher:
     def _media_url(self, content, asset, state, checkpoint, platform):
         provider = public_media_provider()
@@ -54,6 +70,8 @@ class MetaPublisher:
             result = response.json()
         except ValueError:
             raise ProviderError("Meta returned an unreadable response", uncertain=outward)
+        if not isinstance(result, dict):
+            raise ProviderError("Meta returned an invalid response", uncertain=outward)
         if response.is_error or "error" in result:
             error = result.get("error", {})
             code = error.get("code", response.status_code)
@@ -118,19 +136,56 @@ class MetaPublisher:
             raise ProviderError("Meta media container is not publishable; inspect container status")
 
     def _facebook(self, content, account, state, checkpoint):
+        plan = facebook_publication_plan(content, account)
+        if plan["mode"] == "TEXT":
+            checkpoint({**state, "outward_started": True})
+            result = self.request(account, "POST", f"{account.account_id}/feed",
+                                  {"message": plan["message"]}, outward=True)
+            return self._facebook_post_id(result)
+        if plan["mode"] == "SINGLE_IMAGE":
+            url = self._media_url(content, content.assets[0], state, checkpoint, "facebook")
+            checkpoint({**state, "outward_started": True})
+            result = self.request(account, "POST", f"{account.account_id}/photos",
+                                  {"url": url, "caption": plan["message"], "published": "true"}, outward=True)
+            post_id = result.get("post_id") if isinstance(result, dict) else None
+            if isinstance(post_id, str) and post_id:
+                return post_id
+            photo_id = result.get("id") if isinstance(result, dict) else None
+            if not isinstance(photo_id, str) or not photo_id:
+                raise ProviderError("Facebook photo creation returned no publication ID; reconcile the Page", uncertain=True)
+            try:
+                photo = self.request(account, "GET", photo_id, {"fields": "post_id"})
+            except ProviderError:
+                raise ProviderError("Facebook photo was created but its post ID could not be read; reconcile the Page",
+                                    uncertain=True) from None
+            post_id = photo.get("post_id") if isinstance(photo, dict) else None
+            if not isinstance(post_id, str) or not post_id:
+                raise ProviderError("Facebook photo post ID is unavailable; reconcile the Page", uncertain=True)
+            return post_id
         media = list(state.get("media", []))
         for asset in content.assets[len(media):]:
             result = self.request(account, "POST", f"{account.account_id}/photos", {
-                "url": self._media_url(content, asset, state, checkpoint, "facebook"), "published": "false"})
-            media.append(result["id"])
+                "url": self._media_url(content, asset, state, checkpoint, "facebook"), "published": "false"},
+                outward=True)
+            photo_id = result.get("id") if isinstance(result, dict) else None
+            if not isinstance(photo_id, str) or not photo_id:
+                raise ProviderError("Facebook photo upload returned no ID; reconcile before retry", uncertain=True)
+            media.append(photo_id)
             state = {**state, "media": media}
             checkpoint(state)
-        data = {"message": caption(content) or content.body}
-        if media:
-            data["attached_media"] = json.dumps([{"media_fbid": key} for key in media])
+        data = {"message": plan["message"]}
+        data.update({f"attached_media[{index}]": json.dumps({"media_fbid": photo_id})
+                     for index, photo_id in enumerate(media)})
         checkpoint({**state, "outward_started": True})
         result = self.request(account, "POST", f"{account.account_id}/feed", data, outward=True)
-        return result["id"]
+        return self._facebook_post_id(result)
+
+    @staticmethod
+    def _facebook_post_id(result):
+        post_id = result.get("id") if isinstance(result, dict) else None
+        if not isinstance(post_id, str) or not post_id:
+            raise ProviderError("Facebook feed response has no post ID; reconcile the Page", uncertain=True)
+        return post_id
 
     def reply(self, account, item, body):
         if item.kind == "dm":

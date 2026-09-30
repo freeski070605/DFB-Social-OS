@@ -45,7 +45,11 @@ def configured(monkeypatch, tmp_path):
     return cfg
 
 
-def rendered(tmp_path, extension="png", data=b"\x89PNG\r\n\x1a\nrest"):
+def rendered(tmp_path, extension="png", data=None):
+    if data is None:
+        output = BytesIO()
+        Image.new("RGB", (10, 10), "white").save(output, format="JPEG" if extension in {"jpg", "jpeg"} else "PNG")
+        data = output.getvalue()
     digest = hashlib.sha256(data).hexdigest()
     asset = {"key": f"brand/1/r1-1-{digest[:24]}.{extension}", "sha256": digest}
     LocalStorage(tmp_path).write(asset["key"], data)
@@ -67,11 +71,11 @@ def test_r2_upload_mime_url_rejection_and_delete(monkeypatch, tmp_path):
         provider.delete("../private-object")
     with pytest.raises(ProviderError, match="Only approved rendered"):
         provider.prepare_object(item, {"key": "../../secret.png"})
-    jpeg, image = rendered(tmp_path, "jpg", b"\xff\xd8\xffrest")
+    jpeg, image = rendered(tmp_path, "jpg")
     key, _ = provider.prepare_object(jpeg, image)
     assert fake.objects[key]["ContentType"] == "image/jpeg"
     unsupported, wrong = rendered(tmp_path, "png", b"not an image")
-    with pytest.raises(ProviderError, match="supported PNG or JPEG"):
+    with pytest.raises(ProviderError, match="INVALID_MEDIA"):
         provider.prepare_object(unsupported, wrong)
     fake.fail_upload = True
     with pytest.raises(ProviderError, match="R2 media upload failed") as error:
@@ -186,12 +190,12 @@ def test_facebook_text_dry_run_ready_without_meta_mutation(monkeypatch):
                        format="statement", assets=[], caption="Caption", targets=["facebook"]))
         db.add(PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                                token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                               "permissions": ["pages_manage_posts"]}))
+                                                               "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]}))
         db.commit()
         monkeypatch.setattr(MetaPublisher, "request", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Meta")))
         result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
             account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
-        assert result["status"] == "READY" and result["plan"][0]["action"] == "Facebook Page text feed"
+        assert result["status"] == "READY" and result["plan"][0]["action"] == "Facebook Page text"
         assert db.get(SystemSetting, "manual_publish_plan:" + result["plan_token"])
         assert not db.query(Publication).count()
         data = content_api.ManualPublishInput(platforms=["facebook"], account_ids={"facebook": 1},
@@ -231,7 +235,7 @@ def test_image_dry_run_verifies_url_and_cleans_without_meta(monkeypatch, tmp_pat
                        format="statement", assets=[asset], caption="Caption", targets=["facebook"]))
         db.add(PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                                token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                               "permissions": ["pages_manage_posts"]}))
+                                                               "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]}))
         db.commit()
         result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
             account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
@@ -297,7 +301,7 @@ def test_scheduler_does_not_delete_active_dry_run_intent(monkeypatch, tmp_path):
                             format="statement", assets=[asset], caption="Caption", targets=["facebook"]),
                     PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                                     token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                                           "permissions": ["pages_manage_posts"]})])
+                                                                           "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]})])
         db.commit()
         result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
             account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
@@ -341,7 +345,7 @@ def test_dry_run_logs_first_stale_row_error_and_rolls_back(monkeypatch, tmp_path
                             format="statement", assets=[asset], caption="Caption", targets=["facebook"]),
                     PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                                     token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                                           "permissions": ["pages_manage_posts"]})])
+                                                                           "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]})])
         db.commit()
         result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
             account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
@@ -391,7 +395,7 @@ def test_repeated_manual_publish_uses_one_receipt_and_one_external_action(monkey
                        format="statement", assets=[], caption="Caption", targets=["facebook"]))
         db.add(PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
                                token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
-                                                               "permissions": ["pages_manage_posts"]}))
+                                                               "permissions": ["pages_show_list", "pages_read_engagement", "pages_manage_posts"]}))
         db.commit()
         service.publish(db, 1, 1, "owner", ["facebook"], {"facebook": 1})
         service.publish(db, 1, 1, "owner", ["facebook"], {"facebook": 1})

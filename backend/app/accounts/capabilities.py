@@ -19,6 +19,21 @@ PROVIDERS = {
 }
 
 
+def facebook_publishing_issue(account):
+    """Publishing authorization is separate from a healthy Page connection."""
+    config = account.config or {}
+    scopes = set(config.get("permissions") or [])
+    if "pages_manage_posts" not in scopes:
+        return "Additional authorization required: pages_manage_posts"
+    for scope in ("pages_show_list", "pages_read_engagement"):
+        if scope not in scopes:
+            return "Additional authorization required: " + scope
+    tasks = config.get("tasks") or []
+    if tasks and "CREATE_CONTENT" not in tasks:
+        return "Selected Page lacks the CREATE_CONTENT task"
+    return None
+
+
 def provider_view(platform, accounts: list[PlatformAccount]):
     spec = PROVIDERS[platform]
     active = [a for a in accounts if a.platform == platform and a.enabled and
@@ -29,9 +44,7 @@ def provider_view(platform, accounts: list[PlatformAccount]):
         else "NOT_CONNECTED")
     capabilities = list(spec["capabilities"] if state == "CONNECTED" else ())
     if platform == "facebook" and active:
-        scopes = set((active[0].config or {}).get("permissions") or [])
-        tasks = (active[0].config or {}).get("tasks") or []
-        if "pages_manage_posts" not in scopes or (tasks and "CREATE_CONTENT" not in tasks):
+        if facebook_publishing_issue(active[0]):
             capabilities = [item for item in capabilities if item not in {"CAN_PUBLISH_TEXT", "CAN_PUBLISH_IMAGE", "CAN_PUBLISH_CAROUSEL"}]
     if platform in {"facebook", "instagram"} and not r2_verified(object_session(active[0]) if active else None):
         capabilities = [item for item in capabilities if item not in {"CAN_PUBLISH_IMAGE", "CAN_PUBLISH_CAROUSEL"}]

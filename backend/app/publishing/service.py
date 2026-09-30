@@ -11,6 +11,7 @@ from app.core.errors import DomainError, ProviderError
 from app.api.meta_auth import inspect_account
 from app.publishing.public_media import r2_readiness_issue, r2_verified
 from app.accounts.credentials import has_credential
+from app.accounts.capabilities import facebook_publishing_issue
 
 
 def publishing_blockers(item, account, platform, db=None):
@@ -27,12 +28,12 @@ def publishing_blockers(item, account, platform, db=None):
     if config.get("data_access_expires_at") and config["data_access_expires_at"] <= utcnow().timestamp():
         reasons.append("Selected account data access has expired")
     scopes = set(config.get("permissions") or [])
-    required = {"pages_manage_posts"} if platform == "facebook" else {
+    required = set() if platform == "facebook" else {
         "pages_show_list", "pages_read_engagement", "instagram_basic", "instagram_content_publish"}
     for scope in sorted(required - scopes):
         reasons.append("Missing Meta permission: " + scope)
-    if platform == "facebook" and config.get("tasks") and "CREATE_CONTENT" not in config["tasks"]:
-        reasons.append("Selected Page lacks the CREATE_CONTENT task")
+    if platform == "facebook" and (issue := facebook_publishing_issue(account)):
+        reasons.append(issue)
     if platform == "instagram" and not item.assets:
         reasons.append("Instagram requires rendered images")
     if platform == "instagram" and len(caption(item)) > 2200:
@@ -70,7 +71,7 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
     item = require(db, Content, content_id, brand_id)
     if not manual and item.status == "PUBLISHED" and platforms is None:
         return item
-    if item.status not in ({"APPROVED"} if manual else {"APPROVED", "SCHEDULED", "PUBLISHING", "FAILED", "PUBLISHED"}):
+    if item.status not in ({"APPROVED", "PUBLISHED"} if manual else {"APPROVED", "SCHEDULED", "PUBLISHING", "FAILED", "PUBLISHED"}):
         raise DomainError("Content must be approved before publishing", 409)
     targets = list(dict.fromkeys(platforms if platforms is not None else item.targets))
     if not targets or any(platform not in {"facebook", "instagram", "manual"} for platform in targets):
@@ -100,7 +101,8 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                 raise DomainError("Selected account changed; review the destination again", 409)
             if platform != "manual" and not account:
                 pub.state, pub.error = "CONFIGURATION", "No enabled account; use manual export or configure Meta"
-                item.status = "APPROVED"
+                item.status = "PUBLISHED" if db.scalar(select(Publication.id).where(
+                    Publication.content_id == item.id, Publication.state == "PUBLISHED", Publication.id != pub.id)) else "APPROVED"
                 db.commit()
                 raise ProviderError(pub.error)
             if account:
@@ -108,11 +110,19 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                 blockers = publishing_blockers(item, account, platform, db)
                 if blockers:
                     pub.state, pub.error = "CONFIGURATION", "; ".join(blockers)
-                    item.status = "APPROVED"
+                    item.status = "PUBLISHED" if db.scalar(select(Publication.id).where(
+                        Publication.content_id == item.id, Publication.state == "PUBLISHED", Publication.id != pub.id)) else "APPROVED"
                     db.commit()
                     raise ProviderError(pub.error)
             item.status, pub.state, pub.attempts = "PUBLISHING", "SENDING", pub.attempts + 1
-            pub.request_state = {**(pub.request_state or {}), "idempotency_key": (pub.request_state or {}).get("idempotency_key") or secrets.token_hex(16)}
+            pub.request_state = {**(pub.request_state or {}),
+                                 "idempotency_key": (pub.request_state or {}).get("idempotency_key") or secrets.token_hex(16),
+                                 "provider": "META_GRAPH" if platform != "manual" else "LOCAL_EXPORT",
+                                 "account_id": account.id if account else None,
+                                 "account_name": (account.config or {}).get("name") if account else None,
+                                 "page_id": account.account_id if platform == "facebook" else None,
+                                 "content_id": item.id, "revision": item.revision,
+                                 "action_source": action_source}
             record(db, "publication.intent", item.id, brand_id, actor,
                    details={"platform": platform, "action_source": action_source})
             db.commit()  # Intent is durable before any external request.
@@ -124,7 +134,11 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                 external = ManualExportPublisher().publish(item) if platform == "manual" else MetaPublisher().publish(item, account, dict(pub.request_state), checkpoint)
                 pub.external_id, pub.state, pub.error = external, "EXPORTED" if platform == "manual" else "PUBLISHED", ""
                 if platform != "manual":
-                    pub.request_state = {**pub.request_state, "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
+                    published_at = utcnow()
+                    pub.request_state = {**pub.request_state,
+                                         "cleanup_after": (published_at + timedelta(hours=24)).isoformat(),
+                                         "published_at": published_at.isoformat(),
+                                         "provider_response": {"id": external}}
                 record(db, "publication." + pub.state.lower(), item.id, brand_id, actor,
                        after={"platform": platform, "external_id": external},
                        details={"action_source": action_source})
@@ -134,13 +148,15 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                 pub.error = exc.message
                 if pub.state == "CONFIGURATION" and pub.request_state.get("media_objects"):
                     pub.request_state = {**pub.request_state, "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
-                item.status = "FAILED" if exc.uncertain or exc.transient else "APPROVED"
+                published_elsewhere = db.scalar(select(Publication.id).where(Publication.content_id == item.id,
+                    Publication.state == "PUBLISHED", Publication.id != pub.id))
+                item.status = "PUBLISHED" if published_elsewhere else "FAILED" if exc.uncertain or exc.transient else "APPROVED"
                 record(db, "publication.error", item.id, brand_id, actor, result=pub.state,
                        reason=exc.message, details={"platform": platform, "action_source": action_source})
                 db.commit()
                 raise
         states = db.scalars(select(Publication).where(Publication.content_id == item.id)).all()
-        if all(p.state == "PUBLISHED" for p in states if p.platform != "manual") and any(p.platform != "manual" for p in states):
+        if any(p.state == "PUBLISHED" for p in states):
             item.status, item.published_at = "PUBLISHED", utcnow()
         else:
             item.status = "APPROVED"  # Export is not a publication.
@@ -160,11 +176,13 @@ def reconcile(db, brand_id, publication_id, external_id, confirmed_absent, reaso
         pub.request_state = {"media_objects": pub.request_state.get("media_objects", []),
                              "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
     elif external_id:
-        pub.request_state = {**pub.request_state, "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
+        confirmed_at = utcnow()
+        pub.request_state = {**pub.request_state, "cleanup_after": (confirmed_at + timedelta(hours=24)).isoformat(),
+                             "published_at": confirmed_at.isoformat(), "provider_response": {"id": external_id}}
     item = require(db, Content, pub.content_id, brand_id)
     db.flush()
     pubs = db.scalars(select(Publication).where(Publication.content_id == item.id)).all()
-    if all(p.state == "PUBLISHED" for p in pubs):
+    if any(p.state == "PUBLISHED" for p in pubs):
         item.status, item.published_at = "PUBLISHED", utcnow()
     else:
         item.status = "APPROVED"

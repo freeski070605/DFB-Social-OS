@@ -11,7 +11,7 @@ export interface Job {id: number; kind: string; target_id: number; status: strin
 export interface Approval {id: number; action: string; target_id: number; status: string; reason: string; created_at: string; payload: Json}
 export interface Interaction {id: number; author: string; platform: string; kind: string; body: string; category: string; confidence: number; action: string; draft: string; status: string; taken_over: boolean; created_at: string; reply_id: string}
 export interface Overview {brand: Brand; paused: boolean; counts: Record<string, number>; queue: number; approvals: number; community: number; coverage: number; activity: Audit[]; schedule: Content[]}
-export interface Account {id: number; platform: string; account_id: string; enabled: boolean; token_configured: boolean; name: string; source: string; permissions: string[]; tasks: string[]; token_status: string; token_type: string; expires_at: number | null; data_access_expires_at: number | null; last_checked: string | null}
+export interface Account {id: number; platform: string; account_id: string; enabled: boolean; token_configured: boolean; name: string; source: string; permissions: string[]; tasks: string[]; token_status: string; token_type: string; expires_at: number | null; data_access_expires_at: number | null; last_checked: string | null; publishing_status: string | null; publishing_reason: string}
 export interface Template {id: number; name: string; kind: string; config: Visual; enabled: boolean}
 export interface Publication {id: number; content_id: number; platform: string; external_id: string; state: string; attempts: number; error: string; request_state: Json}
 export interface Strategy {id: number; before: Json; after: Json; reason: string; status: string}
