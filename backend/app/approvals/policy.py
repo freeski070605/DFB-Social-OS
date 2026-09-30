@@ -10,12 +10,17 @@ outward_lock = RLock()
 
 
 def outward_allowed(db, brand):
-    db.refresh(brand)
     setting = db.get(SystemSetting, "autopilot", populate_existing=True)
     if setting is None or setting.value.get("paused", True):
         raise DomainError("Outward actions paused", 409)
+    brand_outward_allowed(db, brand)
+
+
+def brand_outward_allowed(db, brand):
+    """The brand gate also applies to owner-confirmed manual publishing."""
+    db.refresh(brand)
     if not brand.enabled or brand.paused:
-        raise DomainError("Outward actions paused", 409)
+        raise DomainError("Brand outward actions paused", 409)
 
 
 def set_pause(db, paused, brand_id=None, actor="admin"):

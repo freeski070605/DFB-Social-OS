@@ -196,9 +196,10 @@ def test_facebook_text_dry_run_ready_without_meta_mutation(monkeypatch):
         assert not db.query(Publication).count()
         data = content_api.ManualPublishInput(platforms=["facebook"], account_ids={"facebook": 1},
             revision=1, exact_caption="Caption", media_keys=[], plan_token=result["plan_token"], confirmed=True)
-        with pytest.raises(Exception, match="Outward actions paused"):
+        with pytest.raises(Exception, match="Brand outward actions paused"):
             content_api.manual_meta_publish(1, 1, data, admin=SimpleNamespace(username="owner"), db=db)
         assert not db.query(Publication).count()
+        assert db.get(SystemSetting, "manual_publish_plan:" + result["plan_token"])
 
 
 def test_image_dry_run_verifies_url_and_cleans_without_meta(monkeypatch, tmp_path):

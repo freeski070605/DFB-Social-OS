@@ -88,6 +88,8 @@ def execute(db, job):
     else:
         raise DomainError("Unsupported job type")
     job.status = "DONE"
+    if job.kind in {"publish", "reply"}:
+        record(db, "job.done", job.id, brand.id, "system", details={"action_source": "AUTONOMOUS"})
 
 
 def tick():
@@ -109,7 +111,7 @@ def tick():
                     db.rollback()
                     job = db.get(Job, key, populate_existing=True)
                     job.error = exc.message
-                    if exc.message == "Outward actions paused":
+                    if exc.message in {"Outward actions paused", "Brand outward actions paused"}:
                         job.status, job.run_at = "PENDING", utcnow() + timedelta(seconds=30)
                         job.attempts = max(0, job.attempts - 1)
                     elif isinstance(exc, ProviderError) and exc.uncertain:
@@ -118,12 +120,15 @@ def tick():
                         job.status, job.run_at = "PENDING", utcnow() + timedelta(seconds=min(3600, 30 * 2 ** job.attempts))
                     else:
                         job.status = "FAILED"
-                    record(db, "job.failure", key, job.brand_id, "system", result=job.status, reason=exc.message)
+                    record(db, "job.failure", key, job.brand_id, "system", result=job.status,
+                           reason=exc.message, details={"action_source": "AUTONOMOUS"})
                 except Exception:
                     db.rollback()
                     job = db.get(Job, key, populate_existing=True)
                     job.status, job.error = "UNKNOWN" if job.kind in {"publish", "reply"} else "FAILED", "Unexpected failure; inspect local logs"
                     log.exception("job_failure", extra={"job_id": key})
+                    record(db, "job.failure", key, job.brand_id, "system", result=job.status,
+                           reason=job.error, details={"action_source": "AUTONOMOUS"})
                 db.commit()
     except Exception:
         log.exception("scheduler_tick_failed")

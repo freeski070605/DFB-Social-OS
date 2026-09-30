@@ -5,7 +5,7 @@ from app.models import Publication, Content, Brand, PlatformAccount, SystemSetti
 from app.db.session import utcnow
 from app.repositories.common import require
 from app.publishing.providers import MetaPublisher, ManualExportPublisher, caption
-from app.approvals.policy import outward_lock, outward_allowed
+from app.approvals.policy import outward_lock, outward_allowed, brand_outward_allowed
 from app.audit.service import record
 from app.core.errors import DomainError, ProviderError
 from app.api.meta_auth import inspect_account
@@ -62,20 +62,31 @@ def account_for(db, brand_id, platform):
     return account
 
 
-def publish(db, brand_id, content_id, actor="system", platforms=None, account_ids=None):
+def publish(db, brand_id, content_id, actor="system", platforms=None, account_ids=None,
+            action_source="AUTONOMOUS"):
+    if action_source not in {"AUTONOMOUS", "MANUAL_OWNER_CONFIRMED"}:
+        raise DomainError("Invalid publishing action source")
+    manual = action_source == "MANUAL_OWNER_CONFIRMED"
     item = require(db, Content, content_id, brand_id)
-    if item.status == "PUBLISHED" and platforms is None:
+    if not manual and item.status == "PUBLISHED" and platforms is None:
         return item
-    if item.status not in {"APPROVED", "SCHEDULED", "PUBLISHING", "FAILED", "PUBLISHED"}:
+    if item.status not in ({"APPROVED"} if manual else {"APPROVED", "SCHEDULED", "PUBLISHING", "FAILED", "PUBLISHED"}):
         raise DomainError("Content must be approved before publishing", 409)
     targets = list(dict.fromkeys(platforms if platforms is not None else item.targets))
     if not targets or any(platform not in {"facebook", "instagram", "manual"} for platform in targets):
         raise DomainError("Select a supported publishing destination")
     brand = require(db, Brand, brand_id)
     with outward_lock:
-        outward_allowed(db, brand)
+        gate = brand_outward_allowed if manual else outward_allowed
+        gate(db, brand)
+        if manual:
+            from app.publishing.public_media import approved_asset
+            for asset in item.assets:
+                approved_asset(item, asset)
         for platform in targets:
             pub = db.scalar(select(Publication).where(Publication.content_id == item.id, Publication.platform == platform))
+            if manual and pub and pub.state in {"PUBLISHED", "EXPORTED"}:
+                raise DomainError("This destination already has a successful publication receipt", 409)
             if not pub:
                 pub = Publication(content_id=item.id, brand_id=brand_id, platform=platform)
                 db.add(pub)
@@ -102,17 +113,21 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                     raise ProviderError(pub.error)
             item.status, pub.state, pub.attempts = "PUBLISHING", "SENDING", pub.attempts + 1
             pub.request_state = {**(pub.request_state or {}), "idempotency_key": (pub.request_state or {}).get("idempotency_key") or secrets.token_hex(16)}
+            record(db, "publication.intent", item.id, brand_id, actor,
+                   details={"platform": platform, "action_source": action_source})
             db.commit()  # Intent is durable before any external request.
             def checkpoint(state):
                 pub.request_state = state
                 db.commit()
             try:
-                outward_allowed(db, brand)
+                gate(db, brand)
                 external = ManualExportPublisher().publish(item) if platform == "manual" else MetaPublisher().publish(item, account, dict(pub.request_state), checkpoint)
                 pub.external_id, pub.state, pub.error = external, "EXPORTED" if platform == "manual" else "PUBLISHED", ""
                 if platform != "manual":
                     pub.request_state = {**pub.request_state, "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
-                record(db, "publication." + pub.state.lower(), item.id, brand_id, actor, after={"platform": platform, "external_id": external})
+                record(db, "publication." + pub.state.lower(), item.id, brand_id, actor,
+                       after={"platform": platform, "external_id": external},
+                       details={"action_source": action_source})
                 db.commit()
             except ProviderError as exc:
                 pub.state = "UNKNOWN" if exc.uncertain else "RETRY" if exc.transient else "CONFIGURATION"
@@ -120,7 +135,8 @@ def publish(db, brand_id, content_id, actor="system", platforms=None, account_id
                 if pub.state == "CONFIGURATION" and pub.request_state.get("media_objects"):
                     pub.request_state = {**pub.request_state, "cleanup_after": (utcnow() + timedelta(hours=24)).isoformat()}
                 item.status = "FAILED" if exc.uncertain or exc.transient else "APPROVED"
-                record(db, "publication.error", item.id, brand_id, actor, result=pub.state, reason=exc.message)
+                record(db, "publication.error", item.id, brand_id, actor, result=pub.state,
+                       reason=exc.message, details={"platform": platform, "action_source": action_source})
                 db.commit()
                 raise
         states = db.scalars(select(Publication).where(Publication.content_id == item.id)).all()

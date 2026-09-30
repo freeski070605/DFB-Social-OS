@@ -5,7 +5,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from app.db.session import get_db
 from app.security.auth import authenticated
-from app.models import Content, Publication, SystemSetting
+from app.models import Brand, Content, Publication, SystemSetting
 from app.repositories.common import require, serialize, list_brand
 from app.schemas.domain import ContentInput, KnowledgeInput, GenerationInput, ScheduleInput
 from app.content import service as content_service
@@ -26,6 +26,7 @@ import secrets
 import httpx
 from datetime import timedelta
 from app.db.session import utcnow
+from app.approvals.policy import outward_lock, brand_outward_allowed
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
 
@@ -127,30 +128,39 @@ class ManualPublishInput(DryRunInput):
 @router.post("/content/{key}/manual-meta-publish")
 def manual_meta_publish(brand_id: int, key: int, data: ManualPublishInput,
                         admin=Depends(authenticated), db=Depends(get_db)):
-    item = require(db, Content, key, brand_id)
-    if item.revision != data.revision or caption(item) != data.exact_caption or [a["key"] for a in item.assets] != data.media_keys:
-        raise DomainError("Content changed since preview; review it again", 409)
-    if len(set(data.platforms)) != len(data.platforms):
-        raise DomainError("Select each platform once")
-    if not data.confirmed or len(data.plan_token) != 32:
-        raise DomainError("Confirm a current READY dry run before publishing", 409)
-    plan_key = "manual_publish_plan:" + data.plan_token
-    saved = db.get(SystemSetting, plan_key)
-    expected = {"brand_id": brand_id, "content_id": key, "revision": data.revision,
-                "platforms": data.platforms, "account_ids": data.account_ids,
-                "exact_caption": data.exact_caption, "media_keys": data.media_keys}
-    if not saved or saved.value.get("expires_at", "") < utcnow().isoformat() or any(saved.value.get(k) != v for k, v in expected.items()):
-        raise DomainError("READY dry run expired or changed; run it again", 409)
-    db.delete(saved)
-    db.commit()  # A plan is one use, even if an outward safety gate blocks the request.
-    return serialize(publish(db, brand_id, key, admin.username, data.platforms, data.account_ids))
+    with outward_lock:
+        item = require(db, Content, key, brand_id)
+        if item.status != "APPROVED":
+            raise DomainError("Content must be approved before manual publishing", 409)
+        if item.revision != data.revision or caption(item) != data.exact_caption or [a["key"] for a in item.assets] != data.media_keys:
+            raise DomainError("Content changed since preview; review it again", 409)
+        if len(set(data.platforms)) != len(data.platforms):
+            raise DomainError("Select each platform once")
+        if not data.confirmed or len(data.plan_token) != 32:
+            raise DomainError("Confirm a current READY dry run before publishing", 409)
+        plan_key = "manual_publish_plan:" + data.plan_token
+        saved = db.get(SystemSetting, plan_key, populate_existing=True)
+        expected = {"brand_id": brand_id, "content_id": key, "revision": data.revision,
+                    "platforms": data.platforms, "account_ids": data.account_ids,
+                    "exact_caption": data.exact_caption, "media_keys": data.media_keys}
+        if not saved or saved.value.get("expires_at", "") < utcnow().isoformat() or any(saved.value.get(k) != v for k, v in expected.items()):
+            raise DomainError("READY dry run expired or changed; run it again", 409)
+        brand_outward_allowed(db, require(db, Brand, brand_id))
+        for asset in item.assets:
+            approved_asset(item, asset)
+        db.delete(saved)
+        record(db, "publication.manual_confirmation", item.id, brand_id, admin.username,
+               details={"platforms": data.platforms, "action_source": "MANUAL_OWNER_CONFIRMED"})
+        db.commit()  # One use once all local safety gates pass; publication intent is durable before Meta.
+        return serialize(publish(db, brand_id, key, admin.username, data.platforms, data.account_ids,
+                                 action_source="MANUAL_OWNER_CONFIRMED"))
 
 
 @router.post("/content/{key}/publish-dry-run")
 def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(authenticated), db=Depends(get_db)):
     item = require(db, Content, key, brand_id)
     reasons = []
-    if item.status not in {"APPROVED", "SCHEDULED"}:
+    if item.status != "APPROVED":
         reasons.append("Content must be approved and unchanged")
     if len(set(data.platforms)) != len(data.platforms):
         reasons.append("Select each platform once")
@@ -166,7 +176,7 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
         else:
             accounts[platform] = account
             reasons.extend(platform + ": " + reason for reason in publishing_blockers(item, account, platform))
-    if item.status in {"APPROVED", "SCHEDULED"}:
+    if item.status == "APPROVED":
         for asset in item.assets:
             try:
                 approved_asset(item, asset)

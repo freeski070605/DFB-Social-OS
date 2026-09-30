@@ -92,11 +92,13 @@ def reply(db, brand_id, key, body, actor="admin", automatic=False):
         try:
             item.reply_id = MetaPublisher().reply(account, item, body)
             item.status, item.replied_at = "REPLIED", utcnow()
-            record(db, "community.reply", item.id, brand_id, actor, after={"reply_id": item.reply_id, "body": body})
+            record(db, "community.reply", item.id, brand_id, actor, after={"reply_id": item.reply_id, "body": body},
+                   details={"action_source": "AUTONOMOUS" if automatic else "MANUAL"})
             db.commit()
         except ProviderError as exc:
             item.status = "UNKNOWN" if exc.uncertain else "REVIEW"
-            record(db, "community.reply_failed", item.id, brand_id, actor, result=item.status, reason=exc.message)
+            record(db, "community.reply_failed", item.id, brand_id, actor, result=item.status, reason=exc.message,
+                   details={"action_source": "AUTONOMOUS" if automatic else "MANUAL"})
             db.commit()
             raise
     return item
