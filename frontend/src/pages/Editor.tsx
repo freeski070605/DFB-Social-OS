@@ -205,7 +205,7 @@ ${platform==='facebook'?(result.text||item?.body):exactCaption}`))void run(async
   {youtubeUpload&&<div role="status" className="youtube-upload-status"><h3>YouTube upload: {visibleUploadState?.replaceAll('_',' ')}</h3>
    {youtubeUpload.bytes_sent>0&&selectedYoutubeAsset&&<p>Upload transfer: {youtubeUpload.bytes_sent>=selectedYoutubeAsset.byte_size?'COMPLETE':'IN PROGRESS'} · {Math.min(youtubeUpload.bytes_sent,selectedYoutubeAsset.byte_size).toLocaleString()} / {selectedYoutubeAsset.byte_size.toLocaleString()} bytes</p>}
    {visibleUploadState==='PROCESSING'&&<p>YouTube processing: PROCESSING. Processing is not yet confirmed complete.</p>}
-   {youtubeUpload.provider_video_id&&<p>YouTube video ID: <code>{youtubeUpload.provider_video_id}</code></p>}
+  {youtubeUpload.provider_video_id&&<><p>YouTube video ID: <code>{youtubeUpload.provider_video_id}</code></p><p><a href={`https://www.youtube.com/watch?v=${encodeURIComponent(youtubeUpload.provider_video_id)}`} target="_blank" rel="noopener noreferrer">View private video on YouTube</a></p></>}
    {youtubeUpload.error&&<p className={youtubeUpload.state==='FAILED'?'error':'notice'}>{youtubeUpload.error}</p>}
    {youtubeUpload.state==='UPLOADING'&&youtubeUpload.id>0&&<button disabled={youtubeBusy||brand.paused||controls?.brand_paused} onClick={()=>void resumeYoutube()}>Resume saved upload</button>}
   </div>}
