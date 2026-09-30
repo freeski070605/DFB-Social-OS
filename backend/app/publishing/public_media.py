@@ -52,19 +52,31 @@ KEY_PATTERN = re.compile(r"meta-publish/[0-9a-f]{32}\.(png|jpe?g)")
 
 
 def r2_ready() -> bool:
+    return r2_readiness_issue() is None
+
+
+def r2_readiness_issue() -> str | None:
     cfg = settings()
+    if cfg.public_media_provider != "r2":
+        return "R2 public media provider is not selected"
+    if not all((cfg.r2_account_id, cfg.r2_access_key_id, cfg.r2_secret_access_key,
+                cfg.r2_bucket, cfg.r2_public_base_url)):
+        return "R2 configuration is missing required fields"
+    if not re.fullmatch(r"[0-9a-f]{32}", cfg.r2_account_id):
+        return "R2 account ID format is invalid"
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", cfg.r2_bucket):
+        return "R2 bucket name is invalid"
     try:
         url = urlsplit(cfg.r2_public_base_url)
         hostname = url.hostname or ""
     except ValueError:
-        return False
-    return (cfg.public_media_provider == "r2" and bool(cfg.r2_account_id and cfg.r2_access_key_id
-            and cfg.r2_secret_access_key and cfg.r2_bucket) and bool(re.fullmatch(r"[0-9a-f]{32}", cfg.r2_account_id))
-            and bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", cfg.r2_bucket))
-            and url.scheme == "https" and bool(hostname) and "." in hostname
-            and hostname not in {"localhost", "127.0.0.1"} and not url.username and not url.password
-            and not url.query and not url.fragment and url.path in {"", "/"}
-            and not hostname.endswith("r2.cloudflarestorage.com") and not hostname.endswith(".r2.dev"))
+        return "R2 public base URL is invalid"
+    if (url.scheme != "https" or not hostname or "." not in hostname
+            or hostname in {"localhost", "127.0.0.1"} or url.username or url.password
+            or url.query or url.fragment or url.path not in {"", "/"}
+            or hostname.endswith("r2.cloudflarestorage.com")):
+        return "R2 public base URL must be a public HTTPS hostname"
+    return None
 
 
 def r2_fingerprint() -> str:
@@ -87,8 +99,9 @@ class R2PublicMediaProvider:
     """Only verified rendered assets enter a dedicated public publishing bucket."""
 
     def __init__(self, client=None):
-        if not r2_ready():
-            raise ProviderError("R2 publishing media is not configured with a dedicated HTTPS public hostname")
+        issue = r2_readiness_issue()
+        if issue:
+            raise ProviderError(issue)
         cfg = settings()
         self.bucket = cfg.r2_bucket
         self.base_url = cfg.r2_public_base_url.rstrip("/")
@@ -98,11 +111,15 @@ class R2PublicMediaProvider:
                 client = boto3.client("s3", endpoint_url=f"https://{cfg.r2_account_id}.r2.cloudflarestorage.com",
                     aws_access_key_id=cfg.r2_access_key_id, aws_secret_access_key=cfg.r2_secret_access_key,
                     region_name="auto")
+            except ImportError:
+                raise ProviderError("R2 client dependency is missing") from None
             except Exception:
                 raise ProviderError("R2 client could not be initialized") from None
         self.client = client
 
     def prepare_object(self, content, asset: dict, platform: str | None = None) -> tuple[str, str]:
+        from botocore.exceptions import ClientError, EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError
+
         data = approved_asset(content, asset)
         extension = asset["key"].rsplit(".", 1)[1]
         if extension == "png" and data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -127,12 +144,22 @@ class R2PublicMediaProvider:
         try:
             self.client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=mime,
                                    CacheControl="no-store")
-        except Exception:
+        except Exception as exc:
             try:
                 self.client.delete_object(Bucket=self.bucket, Key=key)
             except Exception:
                 pass
-            raise ProviderError("R2 media upload failed")
+            if isinstance(exc, (EndpointConnectionError, ConnectTimeoutError, ReadTimeoutError)):
+                raise ProviderError("R2 S3 endpoint connection failed") from None
+            if isinstance(exc, ClientError):
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"InvalidAccessKeyId", "SignatureDoesNotMatch", "InvalidToken", "ExpiredToken"}:
+                    raise ProviderError("R2 credentials are invalid") from None
+                if code in {"NoSuchBucket", "404"}:
+                    raise ProviderError("R2 bucket was not found") from None
+                if code in {"AccessDenied", "AllAccessDisabled"}:
+                    raise ProviderError("R2 media upload was denied") from None
+            raise ProviderError("R2 media upload failed") from None
         return key, self.base_url + "/" + quote(key)
 
     def prepare(self, content, asset: dict) -> str:

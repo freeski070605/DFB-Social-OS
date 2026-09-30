@@ -9,7 +9,7 @@ from app.approvals.policy import outward_lock, outward_allowed
 from app.audit.service import record
 from app.core.errors import DomainError, ProviderError
 from app.api.meta_auth import inspect_account
-from app.publishing.public_media import r2_ready, r2_verified
+from app.publishing.public_media import r2_readiness_issue, r2_verified
 from app.accounts.credentials import has_credential
 
 
@@ -41,8 +41,8 @@ def publishing_blockers(item, account, platform, db=None):
         reasons.append("Facebook text post is empty")
     if item.format in {"reel_script", "short_video_script", "story"}:
         reasons.append("This format is manual export only; Reel publishing is not implemented")
-    if item.assets and not r2_ready():
-        reasons.append("R2 public media provider is unavailable")
+    if item.assets and (issue := r2_readiness_issue()):
+        reasons.append(issue)
     elif item.assets and db is not None and not r2_verified(db):
         reasons.append("R2 public media has not passed a recent dry run")
     if len(item.assets) > 10 and platform == "instagram":

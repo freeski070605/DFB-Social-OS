@@ -3,6 +3,7 @@ from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
+from botocore.exceptions import ClientError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -96,6 +97,48 @@ def test_r2_requires_public_https_hostname(monkeypatch, tmp_path):
     assert not public_media.r2_ready()
     with pytest.raises(ProviderError):
         public_media.R2PublicMediaProvider(FakeR2())
+
+
+def test_r2_dev_public_hostname_is_ready_and_endpoint_url_is_not_an_account_id(monkeypatch, tmp_path):
+    cfg = configured(monkeypatch, tmp_path)
+    cfg.r2_public_base_url = "https://pub-" + "a" * 32 + ".r2.dev"
+    assert public_media.r2_ready()
+    assert public_media.R2PublicMediaProvider(FakeR2()).base_url == cfg.r2_public_base_url
+    cfg.r2_account_id = "https://" + "a" * 32 + ".r2.cloudflarestorage.com"
+    assert public_media.r2_readiness_issue() == "R2 account ID format is invalid"
+
+
+def test_r2_upload_reports_safe_credential_failure(monkeypatch, tmp_path):
+    configured(monkeypatch, tmp_path)
+
+    class InvalidCredentials(FakeR2):
+        def put_object(self, **kwargs):
+            raise ClientError({"Error": {"Code": "SignatureDoesNotMatch", "Message": "secret upstream response"}},
+                              "PutObject")
+
+    item, asset = rendered(tmp_path)
+    with pytest.raises(ProviderError, match="R2 credentials are invalid") as error:
+        public_media.R2PublicMediaProvider(InvalidCredentials()).prepare_object(item, asset)
+    assert "secret" not in str(error.value)
+
+
+def test_dry_run_reports_r2_configuration_issue(monkeypatch, tmp_path):
+    cfg = configured(monkeypatch, tmp_path)
+    cfg.r2_account_id = "https://" + "a" * 32 + ".r2.cloudflarestorage.com"
+    _, asset = rendered(tmp_path)
+    with Session(database()) as db:
+        db.add(Brand(id=1, name="Brand", slug="brand", config={}))
+        db.add(Content(id=1, brand_id=1, topic="Test", pillar="General", status="APPROVED",
+                       format="statement", assets=[asset], caption="Caption", targets=["instagram"]))
+        db.add(PlatformAccount(id=1, brand_id=1, platform="instagram", account_id="123", enabled=True,
+                               token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
+                                   "permissions": ["pages_show_list", "pages_read_engagement", "instagram_basic",
+                                                   "instagram_content_publish"]}))
+        db.commit()
+        result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["instagram"],
+            account_ids={"instagram": 1}), admin=SimpleNamespace(username="owner"), db=db)
+        assert result["status"] == "BLOCKED"
+        assert "instagram: R2 account ID format is invalid" in result["reasons"]
 
 
 def database():

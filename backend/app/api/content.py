@@ -18,7 +18,7 @@ from app.publishing.providers import ManualExportPublisher
 from app.audit.service import record
 from app.knowledge import bulk as knowledge_bulk
 from app.knowledge import review as knowledge_review
-from app.core.errors import DomainError
+from app.core.errors import DomainError, ProviderError
 from app.publishing.service import account_for, publishing_blockers
 from app.publishing.public_media import approved_asset, public_media_provider, r2_fingerprint
 from app.publishing.providers import caption
@@ -205,8 +205,10 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
                                    "Facebook Page feed with images" if urls else "Facebook Page text feed",
                          "caption": caption(item) if platform == "instagram" or urls else caption(item) or item.body,
                          "media_count": len(item.assets), "content_id": item.id, "revision": item.revision})
+    except ProviderError as exc:
+        reasons.append(exc.message)
     except Exception:
-        reasons.append("R2 upload or media validation failed")
+        reasons.append("R2 provider failed during media preparation")
     finally:
         if cleanup.value["objects"]:
             for object_key in list(cleanup.value["objects"]):
