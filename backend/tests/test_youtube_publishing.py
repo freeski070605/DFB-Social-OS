@@ -16,9 +16,18 @@ from app.publishing import youtube
 
 
 class FakeProvider:
-    def __init__(self, *, processing="succeeded", ambiguous=False):
+    def __init__(self, *, processing="succeeded", ambiguous=False, found=True,
+                 channel_id="channel-1", privacy="private", upload_status="processed",
+                 failure_reason=None, rejection_reason=None, issues=None):
         self.processing = processing
         self.ambiguous = ambiguous
+        self.found = found
+        self.channel_id = channel_id
+        self.privacy = privacy
+        self.upload_status = upload_status
+        self.failure_reason = failure_reason
+        self.rejection_reason = rejection_reason
+        self.issues = issues or {}
         self.initiations = 0
         self.chunks = []
         self.session_queries = 0
@@ -39,8 +48,11 @@ class FakeProvider:
             raise youtube.YoutubeProviderError("uncertain test result", uncertain=True)
         return total, "fake-youtube-id"
 
-    def processing_status(self, token, video_id):
-        return self.processing
+    def video_status(self, token, video_id):
+        return {"found": self.found, "video_id": video_id, "channel_id": self.channel_id,
+                "privacy_status": self.privacy, "upload_status": self.upload_status,
+                "processing_status": self.processing, "processing_failure_reason": self.failure_reason,
+                "rejection_reason": self.rejection_reason, "processing_issues": self.issues}
 
 
 @pytest.fixture
@@ -287,6 +299,104 @@ def test_processing_state_does_not_claim_completion(setup):
     assert upload["state"] == "PROCESSING"
     assert youtube.status(db, 1, 1, provider)["state"] == "PROCESSING"
     assert db.scalar(select(Publication).where(Publication.platform == "youtube")).state == "PROCESSING"
+
+
+@pytest.mark.parametrize("provider,expected_state,expected_error", [
+    (FakeProvider(found=False), "RECONCILIATION_REQUIRED", "PROVIDER_VIDEO_NOT_FOUND"),
+    (FakeProvider(channel_id="other-channel"), "RECONCILIATION_REQUIRED", "PROVIDER_CHANNEL_MISMATCH"),
+    (FakeProvider(processing="failed"), "FAILED", "PROVIDER_PROCESSING_FAILED"),
+    (FakeProvider(upload_status="rejected"), "FAILED", "PROVIDER_VIDEO_REJECTED"),
+])
+def test_read_only_reconciliation_never_reuploads(setup, provider, expected_state, expected_error):
+    db = setup
+    asset = make_asset(db, None)
+    plan = ready(db, asset)
+    initial_provider = FakeProvider(processing="processing")
+    upload = youtube.confirm(db, 1, 1, confirmation(plan), "owner", initial_provider)
+    assert upload["state"] == "PROCESSING"
+    result = youtube.status(db, 1, 1, provider)
+    assert result["state"] == expected_state and result["error"] == expected_error
+    receipt = db.scalar(select(Publication).where(Publication.platform == "youtube"))
+    assert receipt.state == expected_state
+    assert provider.initiations == 0 and provider.session_queries == 0 and not provider.chunks
+    assert db.scalar(select(YoutubeUploadAttempt)).provider_video_id == "fake-youtube-id"
+    assert ready(db, asset)["status"] == "BLOCKED"
+    different_asset = make_asset(db, None, data=b"different video bytes")
+    assert ready(db, different_asset)["status"] == "BLOCKED"
+    second_plan = {**plan, "plan_token": "b" * 32}
+    db.add(SystemSetting(key="youtube_manual_plan:" + second_plan["plan_token"], value=second_plan))
+    db.commit()
+    with pytest.raises(DomainError, match="attempt already exists"):
+        youtube.confirm(db, 1, 1, confirmation(second_plan), "owner", provider)
+    assert provider.initiations == 0 and not provider.chunks
+
+
+def test_processing_success_updates_attempt_and_receipt_together(setup):
+    db = setup
+    asset = make_asset(db, None)
+    plan = ready(db, asset)
+    upload = youtube.confirm(db, 1, 1, confirmation(plan), "owner", FakeProvider(processing="processing"))
+    assert upload["state"] == "PROCESSING"
+    provider = FakeProvider(processing="succeeded")
+    assert youtube.status(db, 1, 1, provider)["state"] == "PUBLISHED"
+    receipt = db.scalar(select(Publication).where(Publication.platform == "youtube"))
+    assert receipt.state == "PUBLISHED"
+    assert receipt.request_state["processing_status"] == "succeeded"
+    assert receipt.request_state["privacy_status"] == "private"
+    assert provider.initiations == 0 and not provider.chunks
+
+
+def test_processing_failure_records_sanitized_provider_reason_and_issues(setup):
+    db = setup
+    asset = make_asset(db, None)
+    plan = ready(db, asset)
+    youtube.confirm(db, 1, 1, confirmation(plan), "owner", FakeProvider(processing="processing"))
+    provider = FakeProvider(processing="failed", failure_reason="transcodeFailed",
+        issues={"processingErrors": ["notAVideoFile"], "processingWarnings": ["unsafe detail /path"]})
+    assert youtube.status(db, 1, 1, provider)["state"] == "FAILED"
+    receipt = db.scalar(select(Publication).where(Publication.platform == "youtube"))
+    assert receipt.request_state["processing_failure_reason"] == "transcodeFailed"
+    assert receipt.request_state["processing_issues"]["processingErrors"] == ["notAVideoFile"]
+    assert receipt.request_state["processing_issues"]["processingWarnings"] == []
+
+
+def test_provider_lookup_failure_leaves_processing_uncertain(setup):
+    db = setup
+    asset = make_asset(db, None)
+    plan = ready(db, asset)
+    youtube.confirm(db, 1, 1, confirmation(plan), "owner", FakeProvider(processing="processing"))
+
+    class UnavailableProvider(FakeProvider):
+        def video_status(self, token, video_id):
+            raise youtube.YoutubeProviderError("read-only lookup unavailable")
+
+    provider = UnavailableProvider()
+    assert youtube.status(db, 1, 1, provider)["state"] == "PROCESSING"
+    assert db.scalar(select(Publication).where(Publication.platform == "youtube")).state == "PROCESSING"
+    assert provider.initiations == 0 and not provider.chunks
+
+
+def test_video_reconciliation_uses_only_read_only_videos_list():
+    class ReadOnlyClient:
+        def get(self, url, **kwargs):
+            assert url == "https://www.googleapis.com/youtube/v3/videos"
+            assert kwargs["params"]["id"] == "video-1"
+            assert set(kwargs["params"]["part"].split(",")) == {
+                "status", "processingDetails", "snippet", "suggestions"}
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"items": [{
+                "id": "video-1", "snippet": {"channelId": "channel-1"},
+                "status": {"privacyStatus": "private", "uploadStatus": "processed"},
+                "processingDetails": {"processingStatus": "succeeded"}}]})
+
+        def post(self, *args, **kwargs):
+            raise AssertionError("Reconciliation must not POST to YouTube")
+
+        def put(self, *args, **kwargs):
+            raise AssertionError("Reconciliation must not PUT to YouTube")
+
+    result = youtube.YouTubeResumableProvider(client=ReadOnlyClient()).video_status("test-token", "video-1")
+    assert result["found"] and result["processing_status"] == "succeeded"
+    assert result["privacy_status"] == "private" and result["channel_id"] == "channel-1"
 
 
 def test_official_request_uses_private_resumable_metadata_without_network():

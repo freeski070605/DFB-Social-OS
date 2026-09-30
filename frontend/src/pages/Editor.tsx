@@ -4,6 +4,7 @@ import {api,apiUpload,apiUrl,brandPath,formats,kinds,label} from '../services/ap
 import {readableError} from '../services/validation'
 import {eligibleCandidates} from '../services/knowledgeCandidates'
 import {normalizeDryRunResponse,requestError,type PublishingPlatform,type PublishingResult} from '../services/publishing'
+import {visibleYoutubeState} from '../services/youtubeStatus'
 import {useData} from '../hooks/useData'
 import {Badge,Field,Panel,useAction,Status} from '../components/ui'
 import {YouTubeVideoPicker} from '../components/YouTubeVideoPicker'
@@ -35,6 +36,8 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
  const {busy,run}=useAction(),path=(suffix:string)=>brandPath(brand.id,suffix)
  const {data: controls} = useData<{global_paused:boolean;brand_paused:boolean}>(`/system?brand_id=${brand.id}`)
  const {data: receipts,reload: reloadReceipts} = useData<Publication[]>(path('/publications'))
+ const youtubeReceipt=receipts?.find(receipt=>receipt.content_id===item?.id&&receipt.platform==='youtube')
+ const visibleUploadState=visibleYoutubeState(youtubeUpload,youtubeReceipt)
  const candidateKey=JSON.stringify([brand.id,draft.topic,draft.pillar])
  const knowledge=candidates.key===candidateKey?eligibleCandidates(candidates.items,brand.id,draft.pillar):[]
  const editorialReview=item?.quality.editorial
@@ -45,9 +48,12 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
   useEffect(()=>{let active=true;if(!id){setYoutubeAssets([]);setYoutubeAssetId('');return()=>{active=false}}
    api<YouTubeAsset[]>(path(`/content/${id}/youtube-assets`)).then(rows=>{if(active){setYoutubeAssets(rows);setYoutubeAssetId(current=>rows.some(asset=>String(asset.id)===current)?current:String(rows[0]?.id||''))}}).catch(()=>{if(active)setYoutubeAssets([])})
    return()=>{active=false}},[id,brand.id,item?.revision])
+  useEffect(()=>{let active=true;if(!id){setYoutubeUpload(null);return()=>{active=false}}
+    api<YouTubeUpload|null>(path(`/content/${id}/youtube-upload`)).then(value=>{if(active)setYoutubeUpload(value)}).catch(()=>{})
+    return()=>{active=false}},[id,brand.id])
   useEffect(()=>{if(!id||!['PREPARING','UPLOADING','PROCESSING'].includes(youtubeUpload?.state||''))return
-    const interval=youtubeUpload?.state==='PROCESSING'?8000:1200
-    const timer=window.setInterval(()=>{api<YouTubeUpload|null>(path(`/content/${id}/youtube-upload`)).then(value=>{if(value)setYoutubeUpload(value)}).catch(()=>{})},interval)
+    const interval=youtubeUpload?.state==='PROCESSING'?30000:1200
+    const timer=window.setInterval(()=>{if(document.hidden)return;api<YouTubeUpload|null>(path(`/content/${id}/youtube-upload`)).then(value=>{if(value){setYoutubeUpload(value);if(['PUBLISHED','FAILED','RECONCILIATION_REQUIRED'].includes(value.state))void reloadReceipts()}}).catch(()=>{})},interval)
    return()=>window.clearInterval(timer)},[id,brand.id,youtubeUpload?.state])
   const youtubeAccount=publishAccounts.find(account=>account.platform==='youtube'&&account.enabled)
   const selectedYoutubeAsset=youtubeAssets.find(asset=>String(asset.id)===youtubeAssetId)
@@ -102,9 +108,9 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
   while(!complete){
    const current=await api<YouTubeUpload|null>(path(`/content/${id}/youtube-upload`)).catch(()=>null)
    if(current){setYoutubeUpload(current);if(['PUBLISHED','FAILED','RECONCILIATION_REQUIRED'].includes(current.state))break}
-    await new Promise(resolve=>window.setTimeout(resolve,current?.state==='PROCESSING'?8000:1200))
+    await new Promise(resolve=>window.setTimeout(resolve,current?.state==='PROCESSING'?30000:1200))
   }
-  const result=await task;setYoutubeUpload(result);setYoutubePlan(null);await reloadReceipts()
+  const result=await task;setYoutubeUpload(current=>current&&['PUBLISHED','FAILED','RECONCILIATION_REQUIRED'].includes(current.state)&&result.state==='PROCESSING'?current:result);setYoutubePlan(null);await reloadReceipts()
  }
  async function confirmYoutube(){if(!id||!youtubePlan?.plan_token||!item||!youtubeAccount)return
   const answer=window.confirm(`THIS VIDEO WILL BE UPLOADED TO YOUTUBE AS PRIVATE.\n\nFinal confirmation: upload ${youtubePlan.filename} to ${youtubePlan.channel_name}?`)
@@ -196,14 +202,14 @@ ${platform==='facebook'?(result.text||item?.body):exactCaption}`))void run(async
    <p className="youtube-warning"><strong>THIS VIDEO WILL BE UPLOADED TO YOUTUBE AS PRIVATE.</strong></p>
    <button className="primary" disabled={youtubeBusy||item?.status!=='APPROVED'||brand.paused||controls?.brand_paused} onClick={()=>void confirmYoutube()}>Final confirmation: upload PRIVATE video</button>
   </div>}
-  {youtubeUpload&&<div role="status" className="youtube-upload-status"><h3>YouTube upload: {youtubeUpload.state.replaceAll('_',' ')}</h3>
-   {youtubeUpload.bytes_sent>0&&selectedYoutubeAsset&&<p>Uploaded {Math.min(youtubeUpload.bytes_sent,selectedYoutubeAsset.byte_size).toLocaleString()} / {selectedYoutubeAsset.byte_size.toLocaleString()} bytes</p>}
-   {youtubeUpload.state==='PROCESSING'&&<p>YouTube has the video and is processing it. Processing is not yet confirmed complete.</p>}
+  {youtubeUpload&&<div role="status" className="youtube-upload-status"><h3>YouTube upload: {visibleUploadState?.replaceAll('_',' ')}</h3>
+   {youtubeUpload.bytes_sent>0&&selectedYoutubeAsset&&<p>Upload transfer: {youtubeUpload.bytes_sent>=selectedYoutubeAsset.byte_size?'COMPLETE':'IN PROGRESS'} · {Math.min(youtubeUpload.bytes_sent,selectedYoutubeAsset.byte_size).toLocaleString()} / {selectedYoutubeAsset.byte_size.toLocaleString()} bytes</p>}
+   {visibleUploadState==='PROCESSING'&&<p>YouTube processing: PROCESSING. Processing is not yet confirmed complete.</p>}
    {youtubeUpload.provider_video_id&&<p>YouTube video ID: <code>{youtubeUpload.provider_video_id}</code></p>}
    {youtubeUpload.error&&<p className={youtubeUpload.state==='FAILED'?'error':'notice'}>{youtubeUpload.error}</p>}
    {youtubeUpload.state==='UPLOADING'&&youtubeUpload.id>0&&<button disabled={youtubeBusy||brand.paused||controls?.brand_paused} onClick={()=>void resumeYoutube()}>Resume saved upload</button>}
   </div>}
-  {receipts?.find(receipt=>receipt.content_id===item?.id&&receipt.platform==='youtube')&&<p><strong>YouTube receipt:</strong> {receipts.find(receipt=>receipt.content_id===item?.id&&receipt.platform==='youtube')?.state} · Video ID {receipts.find(receipt=>receipt.content_id===item?.id&&receipt.platform==='youtube')?.external_id}</p>}
+  {youtubeReceipt&&<p><strong>YouTube receipt:</strong> {youtubeReceipt.state} · Video ID {youtubeReceipt.external_id}</p>}
  </Panel>
  {item&&<Panel title="Editorial review">{editorialReview?<><p className="muted">{editorialReview.note}</p><div className="stack">{Object.entries(editorialReview.dimensions).map(([name,part])=><div key={name}><strong>{label(name)}</strong> {part.score}/{part.max}</div>)}</div>{editorialReview.issues.map(issue=><p className="notice" key={issue}>{issue}</p>)}</>:<p className="muted">Save or generate content to see editorial signals.</p>}{provenance?.knowledge?.length?<><p><strong>Knowledge used</strong></p>{provenance.knowledge.map(ref=><p key={ref.id}>#{ref.id} {ref.title}{ref.source?` · ${ref.source}`:''}</p>)}</>:null}{provenance?.ai_revised!==undefined&&<p className="muted">AI revision pass: {provenance.ai_revised?'Used once':'Not needed'}</p>}</Panel>}
  {item&&<Panel title="Version & provenance"><p>Parent: {item.parent_id?<button className="text-button" onClick={()=>navigate('Create',item.parent_id!)}>Open original #{item.parent_id}</button>:'Original content'}</p><p className="muted">Generate new variant keeps this candidate intact for comparison.</p><details><summary>Generation metadata</summary><pre className="json-view">{JSON.stringify(item.generation,null,2)}</pre></details><button onClick={()=>run(()=>action('transition',{state:'ARCHIVED',reason:'Archived by administrator'}),'Content archived')} disabled={busy||item.status==='ARCHIVED'||item.status==='PUBLISHING'}>Archive content</button></Panel>}</aside></div></>

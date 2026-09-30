@@ -136,6 +136,14 @@ def metadata_idempotency_key(content_id, revision, asset_hash, channel_id):
     return hashlib.sha256(raw).hexdigest()
 
 
+def blocking_upload_attempt(db, brand_id, content_id):
+    attempts = db.scalars(select(YoutubeUploadAttempt).where(
+        YoutubeUploadAttempt.brand_id == brand_id, YoutubeUploadAttempt.content_id == content_id)).all()
+    return next((attempt for attempt in attempts if attempt.state in {
+        "PREPARING", "UPLOADING", "PROCESSING", "RECONCILIATION_REQUIRED", "PUBLISHED"}
+        or attempt.provider_video_id or attempt.session_uri or attempt.bytes_sent), None)
+
+
 def _account(db, brand_id, account_id, allow_refresh=False):
     account = db.get(PlatformAccount, account_id) if account_id else None
     if not account or account.brand_id != brand_id or account.platform != "youtube" or not account.enabled:
@@ -193,6 +201,8 @@ def dry_run(db, brand_id, content_id, account_id, asset_id, title, description, 
                                                 Publication.platform == "youtube"))
     if prior and prior.state == "PUBLISHED":
         reasons.append("This content already has a successful YouTube receipt")
+    if blocking_upload_attempt(db, brand_id, content_id):
+        reasons.append("A YouTube upload attempt already exists for this content; reconcile it before another upload")
     if account and asset:
         key = metadata_idempotency_key(content_id, item.revision, asset.sha256, account.account_id)
         existing = db.scalar(select(YoutubeUploadAttempt).where(YoutubeUploadAttempt.idempotency_key == key))
@@ -288,16 +298,28 @@ class YouTubeResumableProvider:
             raise YoutubeProviderError("YouTube upload status did not identify a created video", uncertain=True)
         return total, str(video_id)
 
-    def processing_status(self, token, video_id):
+    def video_status(self, token, video_id):
         try:
             response = self.client.get("https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "processingDetails,status", "id": video_id},
+                params={"part": "processingDetails,status,snippet,suggestions", "id": video_id},
                 headers={"Authorization": "Bearer " + token})
             response.raise_for_status()
             rows = response.json().get("items", [])
-            return rows[0].get("processingDetails", {}).get("processingStatus", "unknown") if rows else "unknown"
-        except (httpx.HTTPError, ValueError):
-            return "unknown"
+        except (httpx.HTTPError, ValueError) as exc:
+            raise YoutubeProviderError("YouTube video status lookup failed") from exc
+        if not rows:
+            return {"found": False}
+        row = rows[0]
+        suggestions = row.get("suggestions", {})
+        return {"found": True, "video_id": row.get("id"),
+                "channel_id": row.get("snippet", {}).get("channelId"),
+                "privacy_status": row.get("status", {}).get("privacyStatus"),
+                "upload_status": row.get("status", {}).get("uploadStatus"),
+                "rejection_reason": row.get("status", {}).get("rejectionReason"),
+                "processing_status": row.get("processingDetails", {}).get("processingStatus", "unknown"),
+                "processing_failure_reason": row.get("processingDetails", {}).get("processingFailureReason"),
+                "processing_issues": {key: suggestions.get(key, []) for key in
+                    ("processingErrors", "processingWarnings", "processingHints")}}
 
 
 def _received_bytes(value):
@@ -474,6 +496,8 @@ def confirm(db, brand_id, content_id, payload, actor, provider=None):
             raise DomainError("Video changed after READY; run YouTube dry run again", 409)
         validate_metadata(payload["title"], payload["description"], payload["intended_format"], payload["audience"])
         brand_outward_allowed(db, db.get(Brand, brand_id))
+        if blocking_upload_attempt(db, brand_id, content_id):
+            raise DomainError("A YouTube attempt already exists; inspect its current state before proceeding", 409)
         key = metadata_idempotency_key(content_id, item.revision, asset.sha256, account.account_id)
         successful = db.scalar(select(Publication).where(Publication.content_id == content_id,
                                                          Publication.platform == "youtube",
@@ -525,25 +549,64 @@ def status(db, brand_id, content_id, provider=None):
         return None
     if attempt.state == "PROCESSING" and attempt.provider_video_id:
         account = db.get(PlatformAccount, attempt.account_id)
+        if not account:
+            attempt.state, attempt.error = "RECONCILIATION_REQUIRED", "CREDENTIAL_ACCOUNT_MISSING"
+            receipt = db.scalar(select(Publication).where(Publication.content_id == content_id,
+                                                           Publication.platform == "youtube"))
+            if receipt:
+                receipt.state = "RECONCILIATION_REQUIRED"
+            db.commit()
+            return _summary(attempt)
         provider = provider or YouTubeResumableProvider()
         try:
-            process = provider.processing_status(_token(account), attempt.provider_video_id)
+            video = provider.video_status(_token(account), attempt.provider_video_id)
         except YoutubeProviderError:
             return _summary(attempt)
-        if process == "succeeded":
-            attempt.state = "PUBLISHED"
-            receipt = db.scalar(select(Publication).where(Publication.content_id == content_id,
-                                                           Publication.platform == "youtube"))
+        receipt = db.scalar(select(Publication).where(Publication.content_id == content_id,
+                                                       Publication.platform == "youtube"))
+        if not receipt or receipt.external_id != attempt.provider_video_id:
+            attempt.state, attempt.error = "RECONCILIATION_REQUIRED", "PROVIDER_RECEIPT_MISMATCH"
             if receipt:
-                receipt.state = "PUBLISHED"
-                receipt.request_state = {**receipt.request_state, "processing_status": "succeeded"}
+                receipt.state = "RECONCILIATION_REQUIRED"
             db.commit()
-        elif process in {"failed", "terminated"}:
-            attempt.state, attempt.error = "FAILED", "YouTube processing did not complete successfully"
-            receipt = db.scalar(select(Publication).where(Publication.content_id == content_id,
-                                                           Publication.platform == "youtube"))
-            if receipt:
-                receipt.state = "FAILED"
-                receipt.request_state = {**receipt.request_state, "processing_status": process}
+            return _summary(attempt)
+        changed = False
+        if not video.get("found"):
+            attempt.state, attempt.error = "RECONCILIATION_REQUIRED", "PROVIDER_VIDEO_NOT_FOUND"
+            changed = True
+        elif video.get("video_id") != attempt.provider_video_id or video.get("channel_id") != attempt.channel_id or account.account_id != attempt.channel_id:
+            attempt.state, attempt.error = "RECONCILIATION_REQUIRED", "PROVIDER_CHANNEL_MISMATCH"
+            changed = True
+        elif video.get("privacy_status") != "private":
+            attempt.state, attempt.error = "RECONCILIATION_REQUIRED", "PROVIDER_PRIVACY_MISMATCH"
+            changed = True
+        elif video.get("upload_status") == "rejected":
+            attempt.state, attempt.error = "FAILED", "PROVIDER_VIDEO_REJECTED"
+            changed = True
+        elif video.get("processing_status") == "succeeded":
+            attempt.state, attempt.error = "PUBLISHED", ""
+            changed = True
+        elif video.get("processing_status") in {"failed", "terminated"}:
+            attempt.state, attempt.error = "FAILED", "PROVIDER_PROCESSING_FAILED"
+            changed = True
+        if receipt:
+            details = {key: video.get(key) for key in ("processing_status", "privacy_status", "upload_status")
+                       if video.get(key) is not None}
+            for key in ("processing_failure_reason", "rejection_reason"):
+                value = video.get(key)
+                if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", value):
+                    details[key] = value
+            issues = video.get("processing_issues")
+            if isinstance(issues, dict):
+                details["processing_issues"] = {key: [item for item in items[:20]
+                    if isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", item)]
+                    for key, items in issues.items() if key in {"processingErrors", "processingWarnings", "processingHints"}
+                    and isinstance(items, list)}
+            updated = {**(receipt.request_state or {}), **details}
+            if updated != receipt.request_state or (changed and receipt.state != attempt.state):
+                receipt.request_state = updated
+                receipt.state = attempt.state
+                changed = True
+        if changed:
             db.commit()
     return _summary(attempt)
