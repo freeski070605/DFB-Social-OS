@@ -13,7 +13,8 @@ def safe(value):
         return [safe(item) for item in value]
     if isinstance(value, str):
         for secret in (settings().encryption_key, settings().meta_app_secret, settings().meta_verify_token,
-                       settings().s3_access_key, settings().s3_secret_key):
+                       settings().s3_access_key, settings().s3_secret_key,
+                       settings().r2_access_key_id, settings().r2_secret_access_key):
             if secret:
                 value = value.replace(secret, "[REDACTED]")
         return re.sub(r"(?i)(bearer\s+|access_token[=:]\s*|client_secret[=:]\s*)[^\s&,;]+", r"\1[REDACTED]", value)

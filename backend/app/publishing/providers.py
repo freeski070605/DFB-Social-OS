@@ -34,6 +34,13 @@ def caption(content):
 
 
 class MetaPublisher:
+    def _media_url(self, content, asset, state, checkpoint, platform):
+        provider = public_media_provider()
+        key, url = provider.prepare_object(content, asset, platform)
+        state.setdefault("media_objects", []).append(key)
+        checkpoint(state)
+        return url
+
     def request(self, account, method, path, data=None, *, outward=False):
         token = decrypt(encrypted_credential(account))
         url = f"https://graph.facebook.com/{settings().meta_api_version}/{path}"
@@ -78,7 +85,7 @@ class MetaPublisher:
         children = list(state.get("children", []))
         if not state.get("container"):
             for asset in content.assets[len(children):]:
-                data = {"image_url": public_media_provider().prepare(content, asset)}
+                data = {"image_url": self._media_url(content, asset, state, checkpoint, "instagram")}
                 if len(content.assets) > 1:
                     data["is_carousel_item"] = "true"
                 else:
@@ -114,7 +121,7 @@ class MetaPublisher:
         media = list(state.get("media", []))
         for asset in content.assets[len(media):]:
             result = self.request(account, "POST", f"{account.account_id}/photos", {
-                "url": public_media_provider().prepare(content, asset), "published": "false"})
+                "url": self._media_url(content, asset, state, checkpoint, "facebook"), "published": "false"})
             media.append(result["id"])
             state = {**state, "media": media}
             checkpoint(state)

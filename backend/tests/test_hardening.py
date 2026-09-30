@@ -173,7 +173,8 @@ def test_uncertain_external_request_cannot_be_treated_as_transient(monkeypatch):
 
 def test_audit_redacts_nested_credentials(monkeypatch):
     monkeypatch.setattr(audit, "settings", lambda: SimpleNamespace(encryption_key="key-secret", meta_app_secret="app-secret",
-        meta_verify_token="verify-secret", s3_access_key="access-secret", s3_secret_key="storage-secret"))
+        meta_verify_token="verify-secret", s3_access_key="access-secret", s3_secret_key="storage-secret",
+        r2_access_key_id="r2-access-secret", r2_secret_access_key="r2-storage-secret"))
     assert audit.safe({"token": "raw-token", "nested": {"secret_key": "storage-secret"},
                        "reason": "Bearer leaked-token"}) == {
         "token": "[REDACTED]", "nested": {"secret_key": "[REDACTED]"}, "reason": "Bearer [REDACTED]"}

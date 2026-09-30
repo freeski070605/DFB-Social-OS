@@ -93,6 +93,8 @@ def execute(db, job):
 def tick():
     try:
         with SessionLocal() as db:
+            from app.publishing.service import cleanup_media
+            cleanup_media(db)
             recurring(db)
             ids = list(db.scalars(select(Job.id).where(Job.status == "PENDING", Job.run_at <= utcnow()).order_by(Job.run_at).limit(8)))
             for key in ids:

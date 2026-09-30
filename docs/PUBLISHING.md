@@ -18,9 +18,32 @@ The Business Login configuration owns the requested permissions; Social OS does 
 
 Instagram image/carousel and Facebook photo publishing require Meta to fetch images from a publicly retrievable HTTPS URL. DFB Social OS no longer serves publishing images from its local server. The `PublicMediaProvider` interface accepts only rendered images attached to approved content. The shipped `LocalUnavailablePublicMediaProvider` rejects image publishing before a Meta container or post is created.
 
-The `.env` accepts reserved S3-compatible settings: `DFB_S3_ENDPOINT`, `DFB_S3_BUCKET`, `DFB_S3_REGION`, `DFB_S3_ACCESS_KEY`, `DFB_S3_SECRET_KEY`, and `DFB_S3_PUBLIC_BASE_URL`. Keep credentials in `.env`, which is excluded from Git and backups. These settings do **not** enable S3 uploads in this release. Install a vetted remote provider adapter before setting `DFB_PUBLIC_MEDIA_PROVIDER` to anything other than `local_unavailable`. That adapter must upload only approved publishing assets, return HTTPS URLs Meta can fetch, and enforce expiry/cleanup according to the bucket policy. No local route exposes arbitrary files.
+The R2 adapter uploads only approved rendered PNG/JPEG assets whose stored digest matches the local bytes. Instagram publishing converts the current PNG render to JPEG in memory before upload. Set these server-side `.env` values and restart the backend:
 
-Facebook text publishing and manual export do not require public media. Instagram image publishing and Facebook photo publishing are unavailable until a remote provider is implemented. Do not point Meta at a private localhost URL.
+```dotenv
+DFB_PUBLIC_MEDIA_PROVIDER=r2
+DFB_R2_ACCOUNT_ID=<32-character Cloudflare account ID>
+DFB_R2_ACCESS_KEY_ID=<R2 token access key ID>
+DFB_R2_SECRET_ACCESS_KEY=<R2 token secret access key>
+DFB_R2_BUCKET=<dedicated publishing bucket>
+DFB_R2_PUBLIC_BASE_URL=https://media.example.com
+```
+
+Create a **dedicated bucket containing only temporary publishing media** in Cloudflare R2. Create an R2 API token scoped to that bucket with object read/write/delete. Attach a production custom domain to that bucket in R2's Public Access settings, with HTTPS enabled, and use its root URL for `DFB_R2_PUBLIC_BASE_URL`. Do not enable the rate-limited `r2.dev` development URL for production. Do not put the existing private media library in this bucket. The S3 API endpoint is used only for authenticated backend uploads; it is not the public URL. The older `DFB_S3_*` settings are reserved and unused. No credentials or public R2 URL are returned through configuration APIs or backup exports.
+
+R2 objects use random names under `meta-publish/`. Meta receives an ordinary public HTTPS URL with no signature or query string. Presigned R2 URLs are available only on the S3 API hostname, and Meta's public URL requirement does not establish that signed query URLs remain reliable throughout asynchronous processing. The dedicated bucket and short object lifecycle keep exposure narrow. Anyone with a temporary URL can fetch that object until deletion. Review Cloudflare caching settings so deleted objects do not remain cached; the adapter sets `Cache-Control: no-store`.
+
+The publishing checkpoint records object keys before calling Meta. Published objects and definite failures become eligible for deletion after 24 hours. Transient processing and ambiguous outcomes remain available until retry or administrator reconciliation reaches a terminal result. The background worker retries failed deletions, including dry-run cleanup, after restart. Keep the scheduler enabled for automatic cleanup; if it is disabled, run cleanup operationally before relying on short retention. Do not delete media immediately after Instagram container creation or Facebook photo creation.
+
+Facebook text publishing and manual export do not require public media. Instagram image publishing and Facebook photo publishing require this R2 configuration. Do not point Meta at a private localhost URL.
+
+## Owner dry run and controlled test publish
+
+Open **Create → an approved rendered content item → Manual Meta publishing dry run**. Choose Facebook, Instagram, or both. Confirm the brand, selected account name and ID, exact caption, and local media previews. Click **Run dry run**. It validates current account health and granted scopes, checks the rendered asset bytes, uploads temporary R2 objects, probes each public HTTPS URL with HEAD, builds a safe request plan, and removes the objects. It never calls a Meta publishing endpoint. It reports **READY** or **BLOCKED** with reasons. It can run while global or brand outward actions are paused. A successful media dry run verifies the current R2 configuration for 24 hours; image capabilities and real image publishing remain blocked when this verification is absent or expired.
+
+If the public URL returns a non-200 response, check the R2 custom domain, bucket public access, HTTPS certificate, and Cloudflare rules. If an upload fails, check the bucket-scoped R2 token and backend environment values. If cleanup fails, the worker retries it. An unhealthy selected account needs **Settings → Accounts → Check connection**. Facebook Page posting requires `pages_manage_posts`; the currently granted permissions listed in this document do not include it. Instagram's Facebook Login flow requires `pages_show_list`, `pages_read_engagement`, `instagram_basic`, and `instagram_content_publish`; all four are present in the current grant, subject to the selected account remaining healthy and Meta account eligibility. Reel publishing is not implemented.
+
+Only after reviewing a **READY** plan may the owner choose **Final confirmation: publish selected platforms**. The one-use plan expires after 30 minutes. The API rechecks the content revision, caption, media keys, selected account IDs, scopes and outward pause gates. Global or brand pause blocks the real action and consumes the plan; run dry run again after any pause change. Each platform has its own durable publication receipt, idempotency key, external ID or failure state. Publishing to both is two sequential external actions; an ambiguous outcome must be reconciled before retry. Do not use a live post to test setup.
 
 ## Webhooks
 

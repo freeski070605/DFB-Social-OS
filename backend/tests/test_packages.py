@@ -75,6 +75,8 @@ def test_capabilities_require_one_verified_selected_account():
                              enabled=False, config={"token_status": "healthy"})
     assert provider_view("facebook", [first, second])["capabilities"] == []
     first.enabled = True
+    assert "CAN_PUBLISH_TEXT" not in provider_view("facebook", [first, second])["capabilities"]
+    first.config = {"token_status": "healthy", "permissions": ["pages_manage_posts"]}
     assert "CAN_PUBLISH_TEXT" in provider_view("facebook", [first, second])["capabilities"]
     assert provider_view("tiktok", [])["support"] == "PLANNED"
     assert provider_view("youtube", [])["capabilities"] == []

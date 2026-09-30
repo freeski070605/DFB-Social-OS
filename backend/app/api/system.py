@@ -11,6 +11,7 @@ from app.schemas.domain import BrandConfig
 from app.ai.providers import provider
 from app.approvals.policy import set_pause
 from app.core.config import ROOT, settings
+from app.publishing.public_media import r2_ready, r2_verified
 from app.storage.local import LocalStorage
 from app.services.backup import backup, restore
 from app.audit.service import record
@@ -58,7 +59,7 @@ def system(brand_id: int, db=Depends(get_db)):
     return {"database": "ready", "storage": "ready", "free_gb": round(disk.free / 1024**3, 1),
         "renderer": "ready" if FONT.exists() else "font_missing", "ai": provider(BrandConfig.model_validate(brand.config).ai).health(),
         "scheduler": "enabled" if settings().scheduler_enabled else "disabled", "encryption": "configured" if settings().encryption_key else "missing",
-        "public_media": "unavailable" if settings().public_media_provider == "local_unavailable" else "unsupported", "meta_api_version": settings().meta_api_version,
+        "public_media": "verified" if r2_verified(db) else "configured" if r2_ready() else "unavailable", "meta_api_version": settings().meta_api_version,
         "webhooks": "configured" if settings().meta_app_secret and settings().meta_verify_token else "missing",
         "global_paused": global_pause.value.get("paused", True) if global_pause else True,
         "brand_paused": brand.paused, "brand_enabled": brand.enabled}

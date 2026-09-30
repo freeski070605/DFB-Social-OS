@@ -5,7 +5,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from app.db.session import get_db
 from app.security.auth import authenticated
-from app.models import Content, Publication
+from app.models import Content, Publication, SystemSetting
 from app.repositories.common import require, serialize, list_brand
 from app.schemas.domain import ContentInput, KnowledgeInput, GenerationInput, ScheduleInput
 from app.content import service as content_service
@@ -19,6 +19,13 @@ from app.audit.service import record
 from app.knowledge import bulk as knowledge_bulk
 from app.knowledge import review as knowledge_review
 from app.core.errors import DomainError
+from app.publishing.service import account_for, publishing_blockers
+from app.publishing.public_media import approved_asset, public_media_provider, r2_fingerprint
+from app.publishing.providers import caption
+import secrets
+import httpx
+from datetime import timedelta
+from app.db.session import utcnow
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
 
@@ -102,6 +109,134 @@ def schedule_content(brand_id: int, key: int, data: ScheduleInput, admin=Depends
 @router.post("/content/{key}/publish")
 def publish_content(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
     return serialize(publish(db, brand_id, key, admin.username))
+
+
+class DryRunInput(BaseModel):
+    platforms: list[Literal["facebook", "instagram"]] = Field(min_length=1, max_length=2)
+    account_ids: dict[str, int]
+
+
+class ManualPublishInput(DryRunInput):
+    revision: int
+    exact_caption: str
+    media_keys: list[str]
+    plan_token: str
+    confirmed: bool
+
+
+@router.post("/content/{key}/manual-meta-publish")
+def manual_meta_publish(brand_id: int, key: int, data: ManualPublishInput,
+                        admin=Depends(authenticated), db=Depends(get_db)):
+    item = require(db, Content, key, brand_id)
+    if item.revision != data.revision or caption(item) != data.exact_caption or [a["key"] for a in item.assets] != data.media_keys:
+        raise DomainError("Content changed since preview; review it again", 409)
+    if len(set(data.platforms)) != len(data.platforms):
+        raise DomainError("Select each platform once")
+    if not data.confirmed or len(data.plan_token) != 32:
+        raise DomainError("Confirm a current READY dry run before publishing", 409)
+    plan_key = "manual_publish_plan:" + data.plan_token
+    saved = db.get(SystemSetting, plan_key)
+    expected = {"brand_id": brand_id, "content_id": key, "revision": data.revision,
+                "platforms": data.platforms, "account_ids": data.account_ids,
+                "exact_caption": data.exact_caption, "media_keys": data.media_keys}
+    if not saved or saved.value.get("expires_at", "") < utcnow().isoformat() or any(saved.value.get(k) != v for k, v in expected.items()):
+        raise DomainError("READY dry run expired or changed; run it again", 409)
+    db.delete(saved)
+    db.commit()  # A plan is one use, even if an outward safety gate blocks the request.
+    return serialize(publish(db, brand_id, key, admin.username, data.platforms, data.account_ids))
+
+
+@router.post("/content/{key}/publish-dry-run")
+def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(authenticated), db=Depends(get_db)):
+    item = require(db, Content, key, brand_id)
+    reasons = []
+    if item.status not in {"APPROVED", "SCHEDULED"}:
+        reasons.append("Content must be approved and unchanged")
+    if len(set(data.platforms)) != len(data.platforms):
+        reasons.append("Select each platform once")
+    accounts = {}
+    for platform in data.platforms:
+        try:
+            account = account_for(db, brand_id, platform)
+        except DomainError as exc:
+            account = None
+            reasons.append(exc.message)
+        if not account or account.id != data.account_ids.get(platform):
+            reasons.append("Explicitly select the active " + platform + " account")
+        else:
+            accounts[platform] = account
+            reasons.extend(platform + ": " + reason for reason in publishing_blockers(item, account, platform))
+    if item.status in {"APPROVED", "SCHEDULED"}:
+        for asset in item.assets:
+            try:
+                approved_asset(item, asset)
+            except Exception:
+                reasons.append("Rendered asset failed validation; render again")
+                break
+    if reasons:
+        return {"status": "BLOCKED", "reasons": reasons, "plan": []}
+
+    plan = []
+    # Persist cleanup intent before validation requests. No Graph publishing endpoint is called.
+    cleanup_key = "dryrun_media:" + secrets.token_hex(16)
+    cleanup = SystemSetting(key=cleanup_key, value={"objects": []})
+    db.add(cleanup)
+    db.commit()
+    try:
+        provider = public_media_provider() if item.assets else None
+        urls = []
+        for platform in data.platforms:
+            for asset in item.assets:
+                object_key, url = provider.prepare_object(item, asset, platform)
+                cleanup.value = {"objects": [*cleanup.value["objects"], object_key]}
+                db.commit()
+                urls.append(url)
+                try:
+                    with httpx.Client(timeout=15, trust_env=False, follow_redirects=False) as client:
+                        response = client.head(url)
+                    if response.status_code != 200:
+                        reasons.append("Public media URL is not accessible over HTTPS (HTTP " + str(response.status_code) + ")")
+                except httpx.HTTPError:
+                    reasons.append("Public media URL accessibility check failed")
+        for platform in data.platforms:
+            plan.append({"platform": platform, "account_id": accounts[platform].id,
+                         "account_name": (accounts[platform].config or {}).get("name", ""),
+                         "action": "Instagram image/carousel" if platform == "instagram" else
+                                   "Facebook Page feed with images" if urls else "Facebook Page text feed",
+                         "caption": caption(item) if platform == "instagram" or urls else caption(item) or item.body,
+                         "media_count": len(item.assets), "content_id": item.id, "revision": item.revision})
+    except Exception:
+        reasons.append("R2 upload or media validation failed")
+    finally:
+        if cleanup.value["objects"]:
+            for object_key in list(cleanup.value["objects"]):
+                try:
+                    provider.delete(object_key)
+                    cleanup.value = {"objects": [value for value in cleanup.value["objects"] if value != object_key]}
+                    db.commit()
+                except Exception:
+                    reasons.append("Temporary media cleanup is pending retry")
+        if not cleanup.value["objects"]:
+            db.delete(cleanup)
+            db.commit()
+    record(db, "publication.dry_run", item.id, brand_id, admin.username,
+           result="BLOCKED" if reasons else "READY", details={"platforms": data.platforms, "media_count": len(item.assets)})
+    plan_token = None
+    if not reasons:
+        plan_token = secrets.token_hex(16)
+        if item.assets:
+            marker = db.get(SystemSetting, "r2_media_health")
+            if marker is None:
+                marker = SystemSetting(key="r2_media_health")
+                db.add(marker)
+            marker.value = {"fingerprint": r2_fingerprint(), "checked_at": utcnow().isoformat()}
+        db.add(SystemSetting(key="manual_publish_plan:" + plan_token, value={
+            "brand_id": brand_id, "content_id": key, "revision": item.revision,
+            "platforms": data.platforms, "account_ids": data.account_ids,
+            "exact_caption": caption(item), "media_keys": [a["key"] for a in item.assets],
+            "expires_at": (utcnow() + timedelta(minutes=30)).isoformat()}))
+    db.commit()
+    return {"status": "BLOCKED" if reasons else "READY", "reasons": reasons, "plan": plan, "plan_token": plan_token}
 
 
 @router.post("/content/{key}/export")
