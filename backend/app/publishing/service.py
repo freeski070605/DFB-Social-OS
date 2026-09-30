@@ -190,6 +190,8 @@ def cleanup_media(db):
             pub.request_state = state
             db.commit()
     for pending in db.scalars(select(SystemSetting).where(SystemSetting.key.like("dryrun_media:%"))):
+        if (pending.value or {}).get("expires_at", "") > utcnow().isoformat():
+            continue  # An active dry run still owns this cleanup intent.
         for key in list((pending.value or {}).get("objects", [])):
             try:
                 public_media_provider().delete(key)

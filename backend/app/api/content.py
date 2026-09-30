@@ -24,11 +24,40 @@ from app.publishing.public_media import approved_asset, public_media_provider, r
 from app.publishing.providers import caption
 import secrets
 import httpx
+import logging
+import sqlite3
 from datetime import timedelta
 from app.db.session import utcnow
 from app.approvals.policy import outward_lock, brand_outward_allowed
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm.exc import StaleDataError
 
 router = APIRouter(prefix="/api/brands/{brand_id}", tags=["content"], dependencies=[Depends(authenticated)])
+log = logging.getLogger("dfb.publishing")
+
+
+def dry_run_db_failure(db, stage, exc):
+    original = getattr(exc, "orig", exc)
+    message = (str(exc) if isinstance(exc, StaleDataError) else
+               str(original) if isinstance(original, sqlite3.Error) else "")
+    log.error("dry_run_database_failed stage=%s exception=%s original=%s message=%s",
+              stage, type(exc).__name__, type(original).__name__, message)
+    db.rollback()
+    raise ProviderError("DRY_RUN_DB_FAILED: Database operation failed during " + stage) from None
+
+
+def dry_run_commit(db, stage):
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        dry_run_db_failure(db, stage, exc)
+
+
+def dry_run_get(db, model, key, stage):
+    try:
+        return db.get(model, key)
+    except SQLAlchemyError as exc:
+        dry_run_db_failure(db, stage, exc)
 
 
 @router.get("/content")
@@ -171,6 +200,8 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
         except DomainError as exc:
             account = None
             reasons.append(exc.message)
+        except SQLAlchemyError as exc:
+            dry_run_db_failure(db, "account_resolution", exc)
         if not account or account.id != data.account_ids.get(platform):
             reasons.append("Explicitly select the active " + platform + " account")
         else:
@@ -189,17 +220,20 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
     plan = []
     # Persist cleanup intent before validation requests. No Graph publishing endpoint is called.
     cleanup_key = "dryrun_media:" + secrets.token_hex(16)
-    cleanup = SystemSetting(key=cleanup_key, value={"objects": []})
+    cleanup_expires_at = (utcnow() + timedelta(minutes=30)).isoformat()
+    cleanup = SystemSetting(key=cleanup_key, value={"objects": [], "expires_at": cleanup_expires_at})
     db.add(cleanup)
-    db.commit()
+    dry_run_commit(db, "cleanup_intent")
+    uploaded_keys = []
     try:
         provider = public_media_provider() if item.assets else None
         urls = []
         for platform in data.platforms:
             for asset in item.assets:
                 object_key, url = provider.prepare_object(item, asset, platform)
-                cleanup.value = {"objects": [*cleanup.value["objects"], object_key]}
-                db.commit()
+                uploaded_keys.append(object_key)
+                cleanup.value = {"objects": uploaded_keys.copy(), "expires_at": cleanup_expires_at}
+                dry_run_commit(db, "media_checkpoint")
                 urls.append(url)
                 try:
                     with httpx.Client(timeout=15, trust_env=False, follow_redirects=False) as client:
@@ -221,27 +255,35 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
                          "media_count": len(item.assets), "content_id": item.id, "revision": item.revision})
     except ProviderError as exc:
         reasons.append(exc.message)
+    except SQLAlchemyError as exc:
+        log.error("dry_run_database_failed stage=media_preparation exception=%s", type(exc).__name__)
+        db.rollback()
+        reasons.append("DRY_RUN_DB_FAILED: Database operation failed during media preparation")
     except Exception:
         reasons.append("R2 provider failed during media preparation")
     finally:
-        if cleanup.value["objects"]:
-            for object_key in list(cleanup.value["objects"]):
+        if uploaded_keys:
+            for object_key in uploaded_keys:
                 try:
                     provider.delete(object_key)
-                    cleanup.value = {"objects": [value for value in cleanup.value["objects"] if value != object_key]}
-                    db.commit()
+                    pending = dry_run_get(db, SystemSetting, cleanup_key, "media_cleanup_lookup")
+                    if pending:
+                        pending.value = {"objects": [value for value in pending.value["objects"] if value != object_key],
+                                         "expires_at": cleanup_expires_at}
+                        dry_run_commit(db, "media_cleanup_checkpoint")
                 except Exception:
                     reasons.append("CLEANUP_FAILED: Temporary media cleanup is pending retry")
-        if not cleanup.value["objects"]:
-            db.delete(cleanup)
-            db.commit()
+        pending = dry_run_get(db, SystemSetting, cleanup_key, "cleanup_intent_lookup")
+        if pending and not pending.value["objects"]:
+            db.delete(pending)
+            dry_run_commit(db, "cleanup_intent_removal")
     record(db, "publication.dry_run", item.id, brand_id, admin.username,
            result="BLOCKED" if reasons else "READY", details={"platforms": data.platforms, "media_count": len(item.assets)})
     plan_token = None
     if not reasons:
         plan_token = secrets.token_hex(16)
         if item.assets:
-            marker = db.get(SystemSetting, "r2_media_health")
+            marker = dry_run_get(db, SystemSetting, "r2_media_health", "health_marker_lookup")
             if marker is None:
                 marker = SystemSetting(key="r2_media_health")
                 db.add(marker)
@@ -251,7 +293,7 @@ def publish_dry_run(brand_id: int, key: int, data: DryRunInput, admin=Depends(au
             "platforms": data.platforms, "account_ids": data.account_ids,
             "exact_caption": caption(item), "media_keys": [a["key"] for a in item.assets],
             "expires_at": (utcnow() + timedelta(minutes=30)).isoformat()}))
-    db.commit()
+    dry_run_commit(db, "dry_run_result")
     return {"status": "BLOCKED" if reasons else "READY", "reasons": reasons, "plan": plan, "plan_token": plan_token}
 
 

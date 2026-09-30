@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from botocore.exceptions import ClientError, SSLError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 from PIL import Image
@@ -267,6 +267,90 @@ def test_dry_run_exposes_tls_category_without_upstream_details(monkeypatch, tmp_
         assert any(reason.startswith("R2_ENDPOINT_TLS_FAILED:") for reason in result["reasons"])
         assert "private" not in str(result) and "secret" not in str(result)
         assert not db.query(Publication).count()
+
+
+def test_scheduler_does_not_delete_active_dry_run_intent(monkeypatch, tmp_path):
+    configured(monkeypatch, tmp_path)
+    _, asset = rendered(tmp_path)
+    engine = database()
+
+    class SweepingR2(FakeR2):
+        def put_object(self, **kwargs):
+            with Session(engine) as sweeper:
+                service.cleanup_media(sweeper)
+            super().put_object(**kwargs)
+
+    fake = SweepingR2()
+    monkeypatch.setattr(content_api, "public_media_provider", lambda: public_media.R2PublicMediaProvider(fake))
+    monkeypatch.setattr(public_media, "public_media_provider", lambda: public_media.R2PublicMediaProvider(fake))
+
+    class HeadClient:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def head(self, url): return SimpleNamespace(status_code=200, headers={"content-type": "image/png"})
+
+    monkeypatch.setattr(content_api.httpx, "Client", HeadClient)
+    with Session(engine) as db:
+        db.add_all([Brand(id=1, name="Brand", slug="brand", config={}),
+                    Content(id=1, brand_id=1, topic="Test", pillar="General", status="APPROVED",
+                            format="statement", assets=[asset], caption="Caption", targets=["facebook"]),
+                    PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
+                                    token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
+                                                                           "permissions": ["pages_manage_posts"]})])
+        db.commit()
+        result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
+            account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
+        assert result["status"] == "READY"
+        assert fake.deleted and not fake.objects
+
+
+def test_scheduler_cleans_expired_dry_run_intent(monkeypatch, tmp_path):
+    configured(monkeypatch, tmp_path)
+    fake = FakeR2()
+    monkeypatch.setattr(public_media, "public_media_provider", lambda: public_media.R2PublicMediaProvider(fake))
+    key = "meta-publish/" + "a" * 32 + ".jpg"
+    with Session(database()) as db:
+        db.add(SystemSetting(key="dryrun_media:expired", value={"objects": [key],
+                                                           "expires_at": "2000-01-01T00:00:00"}))
+        db.commit()
+        service.cleanup_media(db)
+        assert fake.deleted == [key]
+        assert db.get(SystemSetting, "dryrun_media:expired") is None
+
+
+def test_dry_run_logs_first_stale_row_error_and_rolls_back(monkeypatch, tmp_path, caplog):
+    configured(monkeypatch, tmp_path)
+    _, asset = rendered(tmp_path)
+    engine = database()
+
+    class RemovingR2(FakeR2):
+        def put_object(self, **kwargs):
+            with Session(engine) as remover:
+                pending = remover.scalar(select(SystemSetting).where(SystemSetting.key.like("dryrun_media:%")))
+                db.get(SystemSetting, pending.key).value  # Load the active row before the competing delete.
+                remover.delete(pending)
+                remover.commit()
+            super().put_object(**kwargs)
+
+    fake = RemovingR2()
+    monkeypatch.setattr(content_api, "public_media_provider", lambda: public_media.R2PublicMediaProvider(fake))
+    with Session(engine) as db:
+        db.add_all([Brand(id=1, name="Brand", slug="brand", config={}),
+                    Content(id=1, brand_id=1, topic="Test", pillar="General", status="APPROVED",
+                            format="statement", assets=[asset], caption="Caption", targets=["facebook"]),
+                    PlatformAccount(id=1, brand_id=1, platform="facebook", account_id="123", enabled=True,
+                                    token_encrypted="encrypted", config={"token_status": "healthy", "last_checked": "now",
+                                                                           "permissions": ["pages_manage_posts"]})])
+        db.commit()
+        result = content_api.publish_dry_run(1, 1, content_api.DryRunInput(platforms=["facebook"],
+            account_ids={"facebook": 1}), admin=SimpleNamespace(username="owner"), db=db)
+        assert result["status"] == "BLOCKED"
+        assert any(reason.startswith("DRY_RUN_DB_FAILED:") for reason in result["reasons"])
+        assert "PendingRollbackError" not in caplog.text
+        assert "StaleDataError" in caplog.text and "stage=media_checkpoint" in caplog.text
+        assert "expected to update 1 row(s); 0 were matched" in caplog.text
+        assert fake.deleted and not fake.objects
 
 
 def test_cleanup_retries_after_restart(monkeypatch):
