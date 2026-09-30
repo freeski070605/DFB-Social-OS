@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text, JSON, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import String, Text, JSON, DateTime, ForeignKey, UniqueConstraint, Integer, Float
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.session import Base, utcnow
 
@@ -29,6 +29,44 @@ class Publication(Base):
     state: Mapped[str] = mapped_column(String(30), default="READY")
     attempts: Mapped[int] = mapped_column(default=0)
     request_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[object] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[object] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class YoutubeVideoAsset(Base):
+    __tablename__ = "youtube_video_assets"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id"), index=True)
+    content_id: Mapped[int] = mapped_column(ForeignKey("content.id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    storage_key: Mapped[str] = mapped_column(String(500))
+    filename: Mapped[str] = mapped_column(String(255))
+    byte_size: Mapped[int] = mapped_column(Integer)
+    sha256: Mapped[str] = mapped_column(String(64))
+    duration_seconds: Mapped[float] = mapped_column(Float)
+    width: Mapped[int] = mapped_column(Integer)
+    height: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[object] = mapped_column(DateTime, default=utcnow)
+
+
+class YoutubeUploadAttempt(Base):
+    __tablename__ = "youtube_upload_attempts"
+    __table_args__ = (UniqueConstraint("idempotency_key", name="uq_youtube_upload_idempotency"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    brand_id: Mapped[int] = mapped_column(ForeignKey("brands.id"), index=True)
+    content_id: Mapped[int] = mapped_column(ForeignKey("content.id"), index=True)
+    revision: Mapped[int] = mapped_column(Integer)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("youtube_video_assets.id"))
+    asset_sha256: Mapped[str] = mapped_column(String(64))
+    account_id: Mapped[int] = mapped_column(ForeignKey("platform_accounts.id"))
+    channel_id: Mapped[str] = mapped_column(String(200))
+    idempotency_key: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(32), default="PREPARING", index=True)
+    session_uri: Mapped[str] = mapped_column(Text, default="")
+    bytes_sent: Mapped[int] = mapped_column(Integer, default=0)
+    provider_video_id: Mapped[str] = mapped_column(String(200), default="")
+    upload_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[object] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[object] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)

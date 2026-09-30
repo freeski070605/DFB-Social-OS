@@ -45,6 +45,23 @@ If the public URL returns a non-200 response, check the R2 custom domain, bucket
 
 Only after reviewing a **READY** plan may the owner choose **Final confirmation: publish selected platforms**. The one-use plan expires after 30 minutes. The API rechecks the content revision, caption, media keys, selected account IDs, scopes and outward pause gates. Global or brand pause blocks the real action and consumes the plan; run dry run again after any pause change. Each platform has its own durable publication receipt, idempotency key, external ID or failure state. Publishing to both is two sequential external actions; an ambiguous outcome must be reconciled before retry. Do not use a live post to test setup.
 
+## First private YouTube upload
+
+The first YouTube publishing path is owner-confirmed and **PRIVATE only**. Public and unlisted visibility, playlists, thumbnails, scheduling, and autonomous YouTube publishing are not implemented. The global autonomous-action pause may remain on; the brand itself must be enabled with outward actions active.
+
+The backend host must have `ffprobe` on `PATH` and durable read/write access to `DFB_STORAGE_ROOT` (default `data/media`). Video files are copied to local storage in bounded chunks, hashed with SHA-256, and probed for duration and dimensions. Back up that storage together with the database. From the repository root, run `.\scripts\migrate.ps1` in PowerShell, then restart the backend. For a hosted deployment, provision `ffprobe` on the backend image and persist the configured media storage path.
+
+1. Keep global autonomous actions paused. Ensure the LIFE, APPARENTLY. brand is enabled and outward actions are active.
+2. In **Settings → Accounts**, verify the intended YouTube channel, confirm its status is **PUBLISHING READY**, then activate/select that account for the brand.
+3. Open an **APPROVED** content item at its current revision in **Create**.
+4. In **Manual YouTube publishing**, choose the finished local video. Wait for the filename, duration, resolution, and size to appear.
+5. Enter a title (up to 100 characters), description (up to 5,000 characters), intended format, and an explicit made-for-kids audience selection. Privacy is locked to **PRIVATE**.
+6. Click **Run YouTube dry run**. Review the READY channel, asset SHA-256, metadata, and expiry. This validates locally and makes no YouTube mutation request.
+7. Click **Final confirmation: upload PRIVATE video** and accept the warning: **THIS VIDEO WILL BE UPLOADED TO YOUTUBE AS PRIVATE.**
+8. Keep the page open to monitor PREPARING, UPLOADING, PROCESSING, and PUBLISHED. If an interrupted attempt remains UPLOADING, use **Resume saved upload** to continue the same session. If it becomes RECONCILIATION REQUIRED, do not retry or start another upload; inspect the channel and resolve the ambiguous attempt first.
+
+The READY plan expires after 20 minutes. A confirmed upload creates a YouTube receipt when YouTube returns a video ID, but the UI remains PROCESSING until YouTube reports `processingStatus=succeeded`. The receipt contains no OAuth token. The test suite uses fake providers and does not change production videos or receipts.
+
 ## Webhooks
 
 Set `DFB_META_VERIFY_TOKEN` and `DFB_META_APP_SECRET`, then register `https://YOUR_PUBLIC_ORIGIN/api/webhooks/meta` in the Meta app. Webhooks need an independently reachable HTTPS callback. Incoming bodies are size limited and checked using Meta's `X-Hub-Signature-256`. Without webhooks, community interactions can be entered manually.
