@@ -2,6 +2,7 @@
 import {cleanup,fireEvent,render,screen} from '@testing-library/react'
 import {afterEach,describe,expect,it,vi} from 'vitest'
 import {YouTubeVideoPicker} from '../src/components/YouTubeVideoPicker'
+import {apiUpload,setCsrf} from '../src/services/api'
 
 afterEach(()=>{cleanup();vi.restoreAllMocks()})
 
@@ -76,4 +77,19 @@ describe('YouTube video picker',()=>{
   expect((screen.getByRole('button',{name:'Upload / register video'}) as HTMLButtonElement).disabled).toBe(true)
   expect(screen.getByText(reason)).toBeTruthy()
  })
+})
+
+it('sends video FormData without a JSON Content-Type',async()=>{
+ const fetcher=vi.spyOn(globalThis,'fetch').mockResolvedValue(new Response(JSON.stringify({id:1}),{status:200,headers:{'content-type':'application/json'}}))
+ setCsrf('csrf')
+ const body=new FormData()
+ body.append('file',videoFile())
+ body.append('revision','11')
+ await apiUpload('/brands/1/content/15/youtube-assets',body)
+ const [url,options]=fetcher.mock.calls[0]
+ expect(url).toBe('/api/brands/1/content/15/youtube-assets')
+ expect(options?.method).toBe('POST')
+ expect(options?.body).toBe(body)
+ expect(options?.headers).toEqual({'X-CSRF-Token':'csrf'})
+ expect([...body.keys()]).toEqual(['file','revision'])
 })

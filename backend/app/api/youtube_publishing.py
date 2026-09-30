@@ -1,9 +1,13 @@
 """Owner-confirmed, private-only YouTube publishing endpoints."""
+import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from starlette.datastructures import UploadFile as ParsedUploadFile
+from starlette.formparsers import MultiPartException
 
 from app.core.errors import DomainError
 from app.db.session import get_db
@@ -13,7 +17,52 @@ from app.security.auth import authenticated
 from app.publishing.youtube import (asset_view, confirm, dry_run, resume, status,
                                     store_video_asset)
 
+log = logging.getLogger("dfb.video_registration")
+
+
+class VideoRegistrationRoute(APIRoute):
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+
+        async def inspect_multipart(request: Request):
+            if request.method != "POST" or not request.url.path.endswith("/youtube-assets"):
+                return await handler(request)
+            content_type = request.headers.get("content-type", "")
+            received_bytes = 0
+            original_receive = request._receive
+
+            async def count_receive():
+                nonlocal received_bytes
+                message = await original_receive()
+                received_bytes += len(message.get("body", b""))
+                return message
+
+            request._receive = count_receive
+            log.info("registration_request content_type=%s boundary_present=%s content_length=%s endpoint=youtube-assets",
+                     content_type.split(";", 1)[0].lower(), "boundary=" in content_type.lower(),
+                     request.headers.get("content-length", "unavailable"))
+            if not content_type.lower().startswith("multipart/form-data"):
+                raise HTTPException(415, "Video upload request must use multipart/form-data.")
+            try:
+                form = await request.form()
+            except Exception as exc:
+                cause = getattr(exc, "__context__", None)
+                message = cause.message if isinstance(cause, MultiPartException) else "unavailable"
+                log.warning("registration_parse_failed exception=%s cause=%s message=%s received_bytes=%s upload_created=false stored_bytes=0",
+                            type(exc).__name__, type(cause).__name__ if cause else "none",
+                            message, received_bytes)
+                raise HTTPException(400, "Video upload request could not be parsed.") from None
+            upload = form.get("file")
+            log.info("registration_parsed fields=%s received_bytes=%s upload_created=%s upload_bytes=%s stored_bytes=0",
+                     sorted(set(form.keys())), received_bytes, isinstance(upload, ParsedUploadFile),
+                     upload.size if isinstance(upload, ParsedUploadFile) else "unavailable")
+            return await handler(request)
+
+        return inspect_multipart
+
+
 router = APIRouter(prefix="/api/brands/{brand_id}/content/{key}", tags=["youtube-publishing"],
+                   route_class=VideoRegistrationRoute,
                    dependencies=[Depends(authenticated)])
 
 
@@ -26,11 +75,14 @@ def youtube_assets(brand_id: int, key: int, db=Depends(get_db)):
 
 
 @router.post("/youtube-assets")
-def youtube_asset_upload(brand_id: int, key: int, file: UploadFile = File(...),
+def youtube_asset_upload(brand_id: int, key: int, file: UploadFile = File(...), revision: int = Form(...),
                          admin=Depends(authenticated), db=Depends(get_db)):
     item = require(db, Content, key, brand_id)
     if item.status != "APPROVED":
         raise DomainError("Approve the current content revision before selecting its YouTube video", 409)
+    if item.revision != revision:
+        raise DomainError("Selected video targets a stale content revision. Reload the current approved content.", 409)
+    log.info("registration_store_start content_id=%s revision=%s", item.id, item.revision)
     return asset_view(store_video_asset(db, item, file))
 
 

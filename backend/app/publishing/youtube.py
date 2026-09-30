@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -30,6 +31,7 @@ CHUNK_SIZE = 8 * 1024 * 1024
 SUPPORTED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 PRIVATE = "PRIVATE"
 UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+registration_log = logging.getLogger("dfb.video_registration")
 
 
 class YoutubeProviderError(Exception):
@@ -78,10 +80,10 @@ def store_video_asset(db, item, upload):
     destination = storage.path(key)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
+    byte_size = 0
     try:
         with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".youtube-", delete=False) as output:
             temp_path = Path(output.name)
-            byte_size = 0
             digest = hashlib.sha256()
             while chunk := upload.file.read(1024 * 1024):
                 byte_size += len(chunk)
@@ -98,11 +100,15 @@ def store_video_asset(db, item, upload):
         db.add(record)
         db.commit()
         db.refresh(record)
+        registration_log.info("registration_store_complete content_id=%s revision=%s stored_bytes=%s",
+                              item.id, item.revision, byte_size)
         return record
-    except Exception:
+    except Exception as exc:
         if temp_path:
             temp_path.unlink(missing_ok=True)
         destination.unlink(missing_ok=True)
+        registration_log.warning("registration_store_failed content_id=%s revision=%s exception=%s stored_bytes=%s partial_cleaned=true",
+                                 item.id, item.revision, type(exc).__name__, byte_size)
         raise
 
 
