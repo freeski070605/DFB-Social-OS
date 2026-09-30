@@ -83,9 +83,11 @@ def test_meta_business_login_exchanges_and_discovers_without_selecting_or_publis
         accounts = db.scalars(select(PlatformAccount).order_by(PlatformAccount.id)).all()
         assert [(a.platform, a.account_id, a.enabled) for a in accounts] == [
             ("facebook", "123", False), ("instagram", "456", False), ("facebook", "789", False)]
-        assert all(a.brand_id == 1 and a.token_encrypted.startswith("gAAAA") for a in accounts)
-        assert [credential_secrets.decrypt(a.token_encrypted) for a in accounts] == [
-            "page-token-a", "page-token-a", "system-user-token"]
+        assert all(a.brand_id == 1 for a in accounts)
+        assert [credential_secrets.decrypt(a.token_encrypted) for a in (accounts[0], accounts[2])] == [
+            "page-token-a", "system-user-token"]
+        assert accounts[1].token_encrypted == ""
+        assert accounts[1].config["credential_account_id"] == accounts[0].id
         assert [a.config["name"] for a in accounts] == ["Page A", "ig_a", "Page B"]
         assert all(a.config["token_status"] == "healthy" for a in accounts)
         assert [c[0] for c in calls].count("oauth/access_token") == 1

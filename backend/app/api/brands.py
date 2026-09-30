@@ -13,6 +13,7 @@ from app.api.youtube_auth import inspect_account as inspect_youtube
 from app.db.session import utcnow
 from app.core.errors import DomainError
 from app.accounts.capabilities import PROVIDERS, provider_view
+from app.accounts.credentials import has_credential
 from pydantic import BaseModel, Field
 from typing import Literal
 
@@ -123,7 +124,7 @@ def account_check(brand_id: int, key: int, db=Depends(get_db)):
 @router.post("/{brand_id}/accounts/{key}/activate")
 def account_activate(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
     account = require(db, PlatformAccount, key, brand_id)
-    if (account.config or {}).get("token_status") != "healthy" or not account.token_encrypted:
+    if (account.config or {}).get("token_status") != "healthy" or not has_credential(account):
         raise DomainError("Verify this account through its provider before selecting it", 409)
     for other in db.scalars(select(PlatformAccount).where(PlatformAccount.brand_id == brand_id,
                                                           PlatformAccount.platform == account.platform)):
@@ -136,6 +137,11 @@ def account_activate(brand_id: int, key: int, admin=Depends(authenticated), db=D
 @router.delete("/{brand_id}/accounts/{key}")
 def disconnect(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
     account = require(db, PlatformAccount, key, brand_id)
+    if account.platform == "facebook" and any(
+        (other.config or {}).get("credential_account_id") == key
+        for other in list_brand(db, PlatformAccount, brand_id)
+    ):
+        raise DomainError("Disconnect the linked Instagram account before removing its Meta Page credential", 409)
     db.delete(account)
     record(db, "account.disconnect", key, brand_id, admin.username)
     db.commit()

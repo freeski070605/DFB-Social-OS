@@ -20,6 +20,7 @@ from app.models import Brand, PlatformAccount, SystemSetting
 from app.repositories.common import require
 from app.security.auth import authenticated
 from app.security.secrets import encrypt, decrypt
+from app.accounts.credentials import encrypted_credential, has_credential
 
 router = APIRouter(prefix="/api", tags=["meta"])
 log = logging.getLogger("dfb.meta_callback")
@@ -102,7 +103,7 @@ def token_metadata(token, *, stage="credential_validation"):
 def account_view(account):
     config = account.config or {}
     return {"id": account.id, "platform": account.platform, "account_id": account.account_id,
-            "enabled": account.enabled, "token_configured": bool(account.token_encrypted),
+            "enabled": account.enabled, "token_configured": has_credential(account),
             "name": config.get("name", ""), "source": config.get("source", "manual"),
             "permissions": config.get("permissions", []), "tasks": config.get("tasks", []),
             "token_status": config.get("token_status", "unchecked"),
@@ -112,7 +113,7 @@ def account_view(account):
 
 
 def inspect_account(account):
-    token = decrypt(account.token_encrypted)
+    token = decrypt(encrypted_credential(account))
     meta = token_metadata(token) if settings().meta_app_id and settings().meta_app_secret else {}
     identity = graph(account.account_id, token=token, params={"fields": "id,name" if account.platform == "facebook" else "id,username"})
     if str(identity.get("id")) != account.account_id:
@@ -127,6 +128,101 @@ def inspect_account(account):
                       "token_type": meta.get("token_type", old.get("token_type", "")),
                       "last_checked": utcnow().isoformat() + "Z"}
     return account_view(account)
+
+
+def linked_instagram_check(db, page_account):
+    """Inspect one selected Page without changing its authorization or selection."""
+    if page_account.platform != "facebook" or not page_account.enabled or not page_account.token_encrypted:
+        raise DomainError("Select a connected Facebook Page first", 409)
+    token = decrypt(page_account.token_encrypted)
+    metadata = token_metadata(token, stage="linked_instagram_credential")
+    scopes = sorted(metadata.get("scopes") or [])
+    fields = "id,name,instagram_business_account"
+    request_path = f"/{settings().meta_api_version}/{page_account.account_id}?fields={fields}"
+    result = {"request": request_path, "http_status": None, "page_id": page_account.account_id,
+              "page_name": (page_account.config or {}).get("name", ""), "granted_permissions": scopes,
+              "instagram_business_account_exists": False, "instagram_id": None, "instagram_username": None,
+              "error_type": None, "error_code": None, "error_subcode": None, "error_message": None,
+              "capability": "UNDETERMINED", "registered": False}
+    try:
+        with httpx.Client(timeout=20, trust_env=False) as client:
+            response = client.get(f"https://graph.facebook.com/{settings().meta_api_version}/{page_account.account_id}",
+                                  params={"fields": fields}, headers={"Authorization": f"Bearer {token}"})
+        result["http_status"] = response.status_code
+        body = response.json()
+    except httpx.HTTPError:
+        result["capability"] = "TRANSPORT_ERROR"
+        return result
+    except ValueError:
+        result["capability"] = "MALFORMED_RESPONSE"
+        return result
+    if not isinstance(body, dict):
+        result["capability"] = "MALFORMED_RESPONSE"
+        return result
+    if response.is_error or "error" in body:
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        result.update(error_type=safe_meta_message(error.get("type"), (token,)),
+                      error_code=error.get("code") if isinstance(error.get("code"), int) else None,
+                      error_subcode=error.get("error_subcode") if isinstance(error.get("error_subcode"), int) else None,
+                      error_message=safe_meta_message(error.get("message"), (token, settings().meta_app_secret)),
+                      capability="ACCESS_DENIED" if response.status_code in (400, 401, 403) else "GRAPH_ERROR")
+        return result
+    if str(body.get("id")) != page_account.account_id or not isinstance(body.get("name"), str):
+        result["capability"] = "MALFORMED_RESPONSE"
+        return result
+    result["page_name"] = body["name"]
+    linked = body.get("instagram_business_account")
+    if linked is None:
+        result["capability"] = "PERMISSION_MISSING_OR_LINK_UNAVAILABLE" if "instagram_basic" not in scopes else "NO_API_LINK"
+        return result
+    if not isinstance(linked, dict) or not str(linked.get("id", "")).isdigit():
+        result["capability"] = "MALFORMED_RESPONSE"
+        return result
+    ig_id = str(linked["id"])
+    result.update(instagram_business_account_exists=True, instagram_id=ig_id)
+    try:
+        identity = graph(ig_id, token=token, params={"fields": "id,username"}, stage="linked_instagram_identity")
+    except ProviderError:
+        result["capability"] = "LINKED_IDENTITY_INACCESSIBLE"
+        return result
+    if str(identity.get("id")) != ig_id or not isinstance(identity.get("username"), str):
+        result["capability"] = "MALFORMED_RESPONSE"
+        return result
+    result["instagram_username"] = identity["username"]
+    result["capability"] = "DISCOVERABLE"
+    if db.scalar(select(PlatformAccount.id).where(PlatformAccount.platform == "instagram",
+                  PlatformAccount.account_id == ig_id, PlatformAccount.brand_id != page_account.brand_id)):
+        result["capability"] = "ASSIGNED_TO_OTHER_BRAND"
+        return result
+    account = db.scalar(select(PlatformAccount).where(PlatformAccount.brand_id == page_account.brand_id,
+                        PlatformAccount.platform == "instagram", PlatformAccount.account_id == ig_id))
+    if account is None:
+        account = PlatformAccount(brand_id=page_account.brand_id, platform="instagram", account_id=ig_id)
+        db.add(account)
+    account.token_encrypted = ""
+    account.enabled = False if account.id is None else account.enabled
+    account.config = {**(account.config or {}), "source": "oauth", "name": identity["username"],
+                      "page_id": page_account.account_id, "credential_account_id": page_account.id,
+                      "permissions": scopes,
+                      "token_status": "healthy", "token_type": metadata.get("token_type", ""),
+                      "expires_at": metadata.get("expires_at"),
+                      "data_access_expires_at": metadata.get("data_access_expires_at"),
+                      "last_checked": utcnow().isoformat() + "Z"}
+    result["registered"] = True
+    return result
+
+
+@router.post("/brands/{brand_id}/accounts/{key}/linked-instagram/check")
+def check_linked_instagram(brand_id: int, key: int, admin=Depends(authenticated), db=Depends(get_db)):
+    page = db.scalar(select(PlatformAccount).where(PlatformAccount.id == key,
+                     PlatformAccount.brand_id == brand_id, PlatformAccount.platform == "facebook"))
+    if page is None:
+        raise DomainError("Facebook Page account not found", 404)
+    result = linked_instagram_check(db, page)
+    record(db, "meta.linked_instagram_check", key, brand_id, admin.username,
+           details={"capability": result["capability"], "registered": result["registered"]})
+    db.commit()
+    return result
 
 
 @router.post("/brands/{brand_id}/meta/connect")
@@ -213,12 +309,15 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
                 diagnostic("instagram_discovery", outcome="malformed_response")
                 raise ProviderError("Meta instagram_discovery returned malformed account data")
             diagnostic("instagram_discovery", outcome="completed", instagram_accounts_discovered=bool(linked and linked.get("id")))
+            page_account_id = None
             for platform, identity, name in (("facebook", page_id, found.get("name", "")),
                                              ("instagram", str((linked or {}).get("id", "")), "")):
                 if not identity or not identity.isdigit():
                     continue
                 if db.scalar(select(PlatformAccount.id).where(PlatformAccount.platform == platform,
                     PlatformAccount.account_id == identity, PlatformAccount.brand_id != brand_id)):
+                    continue
+                if platform == "instagram" and page_account_id is None:
                     continue
                 if platform == "instagram":
                     identity_data = graph(identity, token=page_token, params={"fields": "id,username"}, stage="instagram_identity")
@@ -232,10 +331,17 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
                     account = PlatformAccount(brand_id=brand_id, platform=platform, account_id=identity)
                     db.add(account)
                 # Discovery never authorizes a publishing destination. The admin selects it explicitly.
-                diagnostic("credential_encryption", outcome="started", platform=platform)
-                account.token_encrypted, account.enabled = encrypt(page_token), False
-                diagnostic("credential_encryption", outcome="completed", platform=platform)
-                account.config = {**common, "name": name or identity}
+                if platform == "facebook":
+                    diagnostic("credential_encryption", outcome="started", platform=platform)
+                    account.token_encrypted = encrypt(page_token)
+                    diagnostic("credential_encryption", outcome="completed", platform=platform)
+                    db.flush()
+                    page_account_id = account.id
+                else:
+                    account.token_encrypted = ""
+                account.enabled = False
+                account.config = {**common, "name": name or identity,
+                                  **({"credential_account_id": page_account_id} if platform == "instagram" else {})}
                 connected += 1
         paging = page.get("paging") or {}
         if not isinstance(paging, dict) or not isinstance(paging.get("cursors") or {}, dict):

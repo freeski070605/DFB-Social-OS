@@ -6,6 +6,7 @@ import httpx
 from app.core.config import settings
 from app.core.errors import ProviderError
 from app.security.secrets import decrypt
+from app.accounts.credentials import encrypted_credential
 from app.storage.local import LocalStorage
 from app.repositories.common import serialize
 from app.publishing.public_media import public_media_provider
@@ -34,7 +35,7 @@ def caption(content):
 
 class MetaPublisher:
     def request(self, account, method, path, data=None, *, outward=False):
-        token = decrypt(account.token_encrypted)
+        token = decrypt(encrypted_credential(account))
         url = f"https://graph.facebook.com/{settings().meta_api_version}/{path}"
         try:
             with httpx.Client(timeout=30, trust_env=False) as client:

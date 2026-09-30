@@ -69,7 +69,9 @@ def test_business_callback_persists_encrypted_credentials(callback_case, monkeyp
     accounts = db.scalars(select(PlatformAccount)).all()
     assert [(a.platform, a.account_id, a.enabled) for a in accounts] == [
         ("facebook", "123", False), ("instagram", "456", False)]
-    assert all(credential_secrets.decrypt(a.token_encrypted) == "page-token" for a in accounts)
+    assert credential_secrets.decrypt(accounts[0].token_encrypted) == "page-token"
+    assert accounts[1].token_encrypted == ""
+    assert accounts[1].config["credential_account_id"] == accounts[0].id
     assert "database_persistence" in caplog.text
     assert not any(value in caplog.text for value in ("private-code", "private-state", "system-token", "page-token", "app-secret"))
 
