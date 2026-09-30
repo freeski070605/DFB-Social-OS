@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from pathlib import Path
 from datetime import timedelta
@@ -74,16 +75,24 @@ def test_fresh_state_survives_new_database_session_and_replay_is_rejected(oauth,
     with Session(engine) as db:
         state, redirect = begin(db, admin)
         assert redirect == cfg.youtube_redirect_uri
+        stored = db.get(SystemSetting, "youtube_oauth:" + hashlib.sha256(state.encode()).hexdigest())
+        assert stored.value["provider"] == "youtube"
+        assert stored.value["session_hash"] == "session"
+        assert stored.value["redirect_uri"] == redirect
+        assert stored.value["created_at"] < stored.value["expires_at"]
     database = Path(engine.url.database)
     engine.dispose()
     restarted_engine = create_engine(f"sqlite:///{database}")
     with Session(restarted_engine) as db, caplog.at_level(logging.INFO, logger="dfb.youtube_oauth"):
-        result = youtube_auth.callback(request(), code="code", state=state, admin=admin, db=db)
+        result = youtube_auth.callback(request(), code="private-authorization-code", state=state, admin=admin, db=db)
         assert result.status_code == 303
+        assert "STATE_VALID" in caplog.text
         with pytest.raises(DomainError):
-            youtube_auth.callback(request(), code="code", state=state, admin=admin, db=db)
+            youtube_auth.callback(request(), code="private-authorization-code", state=state, admin=admin, db=db)
         assert "STATE_ALREADY_CONSUMED" in caplog.text
-        assert state not in caplog.text and "code" not in caplog.text
+        assert state not in caplog.text and "private-authorization-code" not in caplog.text
+        assert not db.get(SystemSetting, "youtube_oauth:" + hashlib.sha256(state.encode()).hexdigest())
+        assert db.get(SystemSetting, "youtube_used:" + hashlib.sha256(state.encode()).hexdigest())
         assert db.scalar(select(PlatformAccount).where(PlatformAccount.platform == "youtube"))
     restarted_engine.dispose()
 
@@ -115,9 +124,14 @@ def test_invalid_state_is_classified_and_existing_credential_unchanged(oauth, ca
         assert existing.enabled and existing.token_encrypted == "existing-encrypted"
         assert existing.config["refresh_token_encrypted"] == "existing-refresh"
         if change != "unknown":
-            with pytest.raises(DomainError):
-                youtube_auth.callback(request(), code="code", state=state, admin=admin, db=db)
-            assert "STATE_ALREADY_CONSUMED" in caplog.text
+            assert db.scalar(select(SystemSetting).where(SystemSetting.key.like("youtube_oauth:%")))
+            if change == "session":
+                assert youtube_auth.callback(request(), code="code", state=state, admin=admin, db=db).status_code == 303
+            else:
+                with pytest.raises(DomainError):
+                    youtube_auth.callback(request(), code="code", state=state, admin=admin, db=db)
+                assert db.scalar(select(SystemSetting).where(SystemSetting.key.like("youtube_oauth:%")))
+            assert "STATE_ALREADY_CONSUMED" not in caplog.text
 
 
 def test_consumed_state_rejected_without_provider_request(oauth, monkeypatch, caplog):
@@ -140,6 +154,18 @@ def test_callback_missing_session_is_classified_without_exposing_cookie(caplog):
         with pytest.raises(DomainError, match="Sign in"):
             authenticated(incoming, db=SimpleNamespace(get=lambda *args: None))
     assert "SESSION_MISSING" in caplog.text
+
+
+def test_failed_validation_does_not_consume_unrelated_state(oauth):
+    engine, _ = oauth
+    admin = SimpleNamespace(id=1, username="owner")
+    with Session(engine) as db:
+        first, _ = begin(db, admin)
+        second, _ = begin(db, admin)
+        with pytest.raises(DomainError):
+            youtube_auth.callback(request("wrong"), code="code", state=first, admin=admin, db=db)
+        assert db.scalar(select(SystemSetting).where(SystemSetting.key ==
+            "youtube_oauth:" + hashlib.sha256(second.encode()).hexdigest()))
 
 
 def test_start_rejects_preview_origin(oauth):

@@ -74,7 +74,11 @@ def consume_state(db, pending, digest):
     if result.rowcount != 1:
         db.rollback()
         return False
-    db.add(SystemSetting(key="youtube_used:" + digest, value={"consumed_at": utcnow().isoformat()}))
+    db.add(SystemSetting(key="youtube_used:" + digest, value={
+        "provider": "youtube", "consumed_at": utcnow().isoformat(),
+        "created_at": pending.value.get("created_at"), "expires_at": pending.value.get("expires_at"),
+        "session_hash": pending.value.get("session_hash"),
+        "redirect_uri": pending.value.get("redirect_uri")}))
     db.commit()
     return True
 
@@ -113,13 +117,16 @@ def start(brand_id: int, request: Request, admin=Depends(authenticated), db=Depe
         raise DomainError("YouTube OAuth must start from the production application", 403)
     state = secrets.token_urlsafe(32)
     now = utcnow()
-    db.add(SystemSetting(key="youtube_oauth:" + hashlib.sha256(state.encode()).hexdigest(),
-        value={"brand_id": brand_id, "admin_id": admin.id, "session_hash": request.state.session.token_hash,
+    state_hash = hashlib.sha256(state.encode()).hexdigest()
+    db.add(SystemSetting(key="youtube_oauth:" + state_hash,
+        value={"provider": "youtube", "brand_id": brand_id, "admin_id": admin.id,
+               "session_hash": request.state.session.token_hash,
                "created_at": now.isoformat(), "expires_at": (now + timedelta(minutes=10)).isoformat(),
                "redirect_uri": cfg.youtube_redirect_uri}))
     record(db, "youtube.connect_start", brand_id, brand_id, admin.username)
     db.commit()
     diagnostic("start", authenticated=True, browser_origin=origin or "unavailable",
+               state_hash=state_hash, initiating_session_hash=request.state.session.token_hash,
                redirect_uri=cfg.youtube_redirect_uri, state_record_created=True,
                created_at=now.isoformat(), expires_at=(now + timedelta(minutes=10)).isoformat(),
                bound_admin_id=admin.id, session_bound=True, storage="sqlite_system_settings")
@@ -139,10 +146,14 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
     used = db.get(SystemSetting, "youtube_used:" + digest) if state and not pending else None
     origin = browser_origin(request)
     value = pending.value if pending and isinstance(pending.value, dict) else {}
+    prior = used.value if used and isinstance(used.value, dict) else {}
+    callback_redirect = origin.rstrip("/") + "/api/youtube/callback" if origin else "unavailable"
     category = None
     if not pending:
         category = "STATE_ALREADY_CONSUMED" if used else "STATE_NOT_FOUND"
     elif not all(value.get(field) for field in ("admin_id", "session_hash", "expires_at", "brand_id")):
+        category = "OTHER_VALIDATION_FAILURE"
+    elif value.get("provider", "youtube") != "youtube":
         category = "OTHER_VALIDATION_FAILURE"
     elif value["expires_at"] < utcnow().isoformat():
         category = "STATE_EXPIRED"
@@ -151,27 +162,34 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
     elif value.get("redirect_uri", cfg.youtube_redirect_uri) != cfg.youtube_redirect_uri or (origin and origin != getattr(cfg, "public_origin", "").rstrip("/")):
         category = "REDIRECT_MISMATCH"
     if category:
-        if pending and not consume_state(db, pending, digest):
-            category = "STATE_ALREADY_CONSUMED"
         diagnostic("callback_validation", category=category, authenticated=True,
                    callback_host=getattr(getattr(request, "url", None), "hostname", "unavailable"),
-                   browser_origin=origin or "unavailable", state_record_found=bool(pending),
-                   state_created_at=value.get("created_at"), state_expires_at=value.get("expires_at"),
-                   state_expired=category == "STATE_EXPIRED", state_consumed=bool(used),
-                   bound_admin_id=value.get("admin_id"), session_binding_matched=(value.get("session_hash") == request.state.session.token_hash) if pending else None,
-                   redirect_uri=cfg.youtube_redirect_uri, state_redirect_uri=value.get("redirect_uri"))
+                   browser_origin=origin or "unavailable", state_hash=digest,
+                   callback_session_hash=request.state.session.token_hash,
+                   state_record_found=bool(pending),
+                   state_created_at=value.get("created_at", prior.get("created_at")),
+                   state_expires_at=value.get("expires_at", prior.get("expires_at")),
+                   state_expired=bool(value.get("expires_at") and value["expires_at"] < utcnow().isoformat()),
+                   state_consumed=bool(used), bound_admin_id=value.get("admin_id"),
+                   session_binding_matched=(value.get("session_hash", prior.get("session_hash")) == request.state.session.token_hash) if pending or used else None,
+                   stored_redirect_uri=value.get("redirect_uri", prior.get("redirect_uri")),
+                   callback_redirect_uri=callback_redirect, expected_redirect_uri=cfg.youtube_redirect_uri)
         raise DomainError("YouTube connection expired or state validation failed", 403)
     brand_id = pending.value["brand_id"]
-    if not consume_state(db, pending, digest):
-        diagnostic("callback_validation", category="STATE_ALREADY_CONSUMED", authenticated=True)
-        raise DomainError("YouTube connection expired or state validation failed", 403)
-    diagnostic("callback_validation", category="PASSED", authenticated=True,
+    diagnostic("callback_validation", category="STATE_VALID", authenticated=True,
                callback_host=getattr(getattr(request, "url", None), "hostname", "unavailable"),
-               browser_origin=origin or "unavailable", state_record_found=True,
-               state_created_at=value.get("created_at"), state_expires_at=value.get("expires_at"),
-               state_expired=False, state_consumed=False, bound_admin_id=value.get("admin_id"),
-               session_binding_matched=True, redirect_uri=cfg.youtube_redirect_uri,
-               state_redirect_uri=value.get("redirect_uri"))
+               browser_origin=origin or "unavailable", state_hash=digest,
+               callback_session_hash=request.state.session.token_hash,
+               state_record_found=True, state_created_at=value.get("created_at"),
+               state_expires_at=value.get("expires_at"), state_expired=False, state_consumed=False,
+               bound_admin_id=value.get("admin_id"), session_binding_matched=True,
+               stored_redirect_uri=value.get("redirect_uri"), callback_redirect_uri=callback_redirect,
+               expected_redirect_uri=cfg.youtube_redirect_uri)
+    if not consume_state(db, pending, digest):
+        diagnostic("callback_validation", category="STATE_ALREADY_CONSUMED", authenticated=True,
+                   state_hash=digest, callback_session_hash=request.state.session.token_hash)
+        raise DomainError("YouTube connection expired or state validation failed", 403)
+    diagnostic("state_consumed", state_hash=digest)
     if error or not code:
         raise DomainError("YouTube authorization was denied or cancelled")
     try:
@@ -182,11 +200,14 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
             response.raise_for_status()
             token = response.json()
     except (httpx.HTTPError, ValueError) as exc:
+        diagnostic("code_exchange", state_hash=digest, outcome="failed", error_type=type(exc).__name__)
         raise ProviderError("YouTube token exchange failed") from exc
+    diagnostic("code_exchange", state_hash=digest, outcome="completed")
     granted = granted_scopes(token.get("scope", ""))
     if not token.get("access_token") or (READONLY_SCOPE not in granted and UPLOAD_SCOPE not in granted):
         raise ProviderError("YouTube channel read permission was not granted")
     found = channels(token["access_token"])
+    diagnostic("channel_discovery", state_hash=digest, outcome="completed", count=len(found))
     count = 0
     for row in found:
         channel_id = str(row.get("id", ""))
@@ -210,4 +231,5 @@ def callback(request: Request, code: str = "", state: str = "", error: str = "",
         count += 1
     record(db, "youtube.connect_complete", brand_id, brand_id, admin.username, details={"channels": count})
     db.commit()
+    diagnostic("connection_complete", state_hash=digest, channels=count)
     return RedirectResponse(f"/?youtube_connected={brand_id}&count={count}", status_code=303)

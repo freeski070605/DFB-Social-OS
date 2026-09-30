@@ -66,9 +66,11 @@ def authenticated(request: Request, db=Depends(get_db)):
     session = db.get(AdminSession, hashlib.sha256(token.encode()).hexdigest()) if token else None
     if not session or session.expires_at < utcnow():
         if getattr(getattr(request, "url", None), "path", None) == "/api/youtube/callback":
+            state = getattr(request, "query_params", {}).get("state", "")
             logging.getLogger("dfb.youtube_oauth").info(
-                "youtube_oauth_callback category=SESSION_MISSING cookie_present=%s session_record_found=%s callback_host=%s browser_origin=%s",
-                bool(token), bool(session), getattr(request.url, "hostname", "unavailable"),
+                "youtube_oauth_callback category=SESSION_MISSING cookie_present=%s session_record_found=%s state_hash=%s callback_host=%s browser_origin=%s",
+                bool(token), bool(session), hashlib.sha256(state.encode()).hexdigest() if state else "unavailable",
+                getattr(request.url, "hostname", "unavailable"),
                 request.headers.get("x-dfb-public-origin", "unavailable"))
         raise DomainError("Sign in to continue", 401)
     if request.method not in {"GET", "HEAD", "OPTIONS"}:
