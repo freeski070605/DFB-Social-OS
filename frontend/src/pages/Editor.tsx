@@ -6,6 +6,7 @@ import {eligibleCandidates} from '../services/knowledgeCandidates'
 import {normalizeDryRunResponse,requestError,type PublishingPlatform,type PublishingResult} from '../services/publishing'
 import {useData} from '../hooks/useData'
 import {Badge,Field,Panel,useAction,Status} from '../components/ui'
+import {YouTubeVideoPicker} from '../components/YouTubeVideoPicker'
 import type {Account,Brand,Content,Job,Knowledge,Publication,Slide} from '../types'
 
 type Draft=Pick<Content,'topic'|'pillar'|'format'|'hook'|'body'|'slides'|'caption'|'cta'|'hashtags'|'knowledge_refs'|'sources'|'targets'|'parent_id'>
@@ -50,6 +51,7 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
    return()=>window.clearInterval(timer)},[id,brand.id,youtubeUpload?.state])
   const youtubeAccount=publishAccounts.find(account=>account.platform==='youtube'&&account.enabled)
   const selectedYoutubeAsset=youtubeAssets.find(asset=>String(asset.id)===youtubeAssetId)
+  const youtubeAssetUploadReason=!id?'Save this draft before registering a YouTube video.':!item||item.id!==id?'Loading the current content before registering a YouTube video.':item.status!=='APPROVED'?'Approve the current content revision before registering its YouTube video.':null
  useEffect(()=>{let active=true;setCandidates({key:candidateKey,items:[],loading:!!draft.topic.trim()&&!!draft.pillar.trim(),error:''})
   if(!draft.topic.trim()||!draft.pillar.trim())return()=>{active=false}
   const timer=setTimeout(()=>{const query=new URLSearchParams({topic:draft.topic,pillar:draft.pillar})
@@ -91,9 +93,7 @@ export default function Editor({brand,id,navigate}: {brand:Brand;id?:number;navi
   throw new Error('Local AI generation is still running. Check Jobs for its status.')
  }catch(reason){setGenerationStatus('');const message=readableError(reason);setError(message);throw new Error(message)}}
  async function action(name:string,body?:unknown){if(!id)throw new Error('Save your draft first');setDryRuns({});const result=await api<Content>(path(`/content/${id}/${name}`),'POST',body);if(result.topic)setItem(result)}
- async function uploadYoutubeAsset(file:File){if(!id)return;setYoutubeBusy(true);setYoutubeError('');setYoutubePlan(null);setYoutubeUpload(null)
-  try{const form=new FormData();form.append('file',file);const asset=await apiUpload<YouTubeAsset>(path(`/content/${id}/youtube-assets`),form);setYoutubeAssets(rows=>[asset,...rows]);setYoutubeAssetId(String(asset.id))}
-  catch(reason){setYoutubeError(readableError(reason))}finally{setYoutubeBusy(false)}}
+ async function uploadYoutubeAsset(file:File){if(!id)throw new Error('Save this draft before registering a YouTube video.');const form=new FormData();form.append('file',file);const asset=await apiUpload<YouTubeAsset>(path(`/content/${id}/youtube-assets`),form);setYoutubeAssets(rows=>[asset,...rows]);setYoutubeAssetId(String(asset.id));setYoutubePlan(null);setYoutubeUpload(null)}
  async function runYoutubeDryRun(){if(!id)return;setYoutubeBusy(true);setYoutubeError('');setYoutubePlan(null)
   try{const plan=await api<YouTubePlan>(path(`/content/${id}/youtube-dry-run`),'POST',{account_id:youtubeAccount?.id,asset_id:Number(youtubeAssetId),title:youtubeTitle,description:youtubeDescription,intended_format:youtubeFormat||null,audience:youtubeAudience||null});setYoutubePlan(plan)}
   catch(reason){setYoutubeError(readableError(reason))}finally{setYoutubeBusy(false)}}
@@ -175,7 +175,7 @@ ${platform==='facebook'?(result.text||item?.body):exactCaption}`))void run(async
  <Panel title="Manual YouTube publishing">
   <p><strong>Destination:</strong> LIFE, APPARENTLY. — YouTube</p>
   <p><strong>Account:</strong> {youtubeAccount?.publishing_status||'NOT CONNECTED'}{youtubeAccount?.name?` · ${youtubeAccount.name}`:''}</p>
-  <Field label="Finished local video"><input type="file" accept=".mp4,.mov,.m4v,.webm,.mkv,video/*" disabled={youtubeBusy||!id||item?.status!=='APPROVED'} onChange={event=>{const file=event.target.files?.[0];if(file)void uploadYoutubeAsset(file);event.target.value=''}}/></Field>
+  <YouTubeVideoPicker disabledReason={youtubeAssetUploadReason} onRegister={uploadYoutubeAsset}/>
   <Field label="Video asset"><select value={youtubeAssetId} onChange={event=>{setYoutubeAssetId(event.target.value);setYoutubePlan(null)}}><option value="">Select a video for revision {item?.revision||'—'}</option>{youtubeAssets.map(asset=><option key={asset.id} value={asset.id}>{asset.filename} · {(asset.byte_size/1024/1024).toFixed(1)} MB</option>)}</select></Field>
   {selectedYoutubeAsset&&<p className="muted">{selectedYoutubeAsset.duration_seconds.toFixed(1)} sec · {selectedYoutubeAsset.width} × {selectedYoutubeAsset.height} · revision {selectedYoutubeAsset.revision}</p>}
   <Field label="Format"><select value={youtubeFormat} onChange={event=>{setYoutubeFormat(event.target.value as typeof youtubeFormat);setYoutubePlan(null)}}><option value="">Select format</option><option value="YOUTUBE_SHORT">Short</option><option value="YOUTUBE_LONGFORM">Long-form</option></select></Field>
